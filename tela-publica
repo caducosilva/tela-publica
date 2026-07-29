@@ -170,6 +170,43 @@ def titulo_janela(jid):
         return ""
 
 
+def _nome_processo(pid):
+    """Nome do .exe do processo (ex.: chrome.exe -> chrome)."""
+    if not IS_WINDOWS or not pid:
+        return ""
+    try:
+        kernel32 = ctypes.windll.kernel32
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not handle:
+            return ""
+        try:
+            size = wintypes.DWORD(260)
+            buf = ctypes.create_unicode_buffer(260)
+            # QueryFullProcessImageNameW
+            if kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+                return os.path.splitext(os.path.basename(buf.value or ""))[0]
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        pass
+    return ""
+
+
+def _janela_cloaked(hwnd):
+    """UWP/abas cloaked nao devem aparecer na lista (estilo Alt+Tab)."""
+    try:
+        dwmapi = ctypes.windll.dwmapi
+        cloaked = wintypes.DWORD(0)
+        # DWMWA_CLOAKED = 14
+        if dwmapi.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(cloaked),
+                                        ctypes.sizeof(cloaked)) == 0:
+            return bool(cloaked.value)
+    except Exception:
+        pass
+    return False
+
+
 def geometria_janela(jid):
     """Retorna x,y,w,h da janela no Windows, ja ajustado pro gdigrab."""
     if not IS_WINDOWS:
@@ -184,8 +221,17 @@ def geometria_janela(jid):
         if not user32.IsWindow(hwnd) or user32.IsIconic(hwnd):
             return None
         rect = wintypes.RECT()
-        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
-            return None
+        # Preferir bounds DWM (sem sombra/borda invisivel do Win10/11).
+        try:
+            dwmapi = ctypes.windll.dwmapi
+            # DWMWA_EXTENDED_FRAME_BOUNDS = 9
+            if dwmapi.DwmGetWindowAttribute(hwnd, 9, ctypes.byref(rect),
+                                            ctypes.sizeof(rect)) != 0:
+                if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                    return None
+        except Exception:
+            if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                return None
         x, y = int(rect.left), int(rect.top)
         w, h = int(rect.right - rect.left), int(rect.bottom - rect.top)
 
@@ -243,6 +289,7 @@ def restaurar_janela(jid):
         try:
             hwnd = int(str(jid), 0)
             user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
             if not user32.IsWindow(hwnd):
                 return False
             # SW_RESTORE=9; se so estiver atras, traz pra frente
@@ -250,9 +297,27 @@ def restaurar_janela(jid):
                 user32.ShowWindow(hwnd, 9)
             else:
                 user32.ShowWindow(hwnd, 5)  # SW_SHOW
-            user32.BringWindowToTop(hwnd)
-            user32.SetForegroundWindow(hwnd)
-            time.sleep(0.4)
+            # SetForegroundWindow costuma falhar sem AttachThreadInput.
+            fg = user32.GetForegroundWindow()
+            pid_fg = wintypes.DWORD()
+            tid_fg = user32.GetWindowThreadProcessId(fg, ctypes.byref(pid_fg)) if fg else 0
+            pid_alvo = wintypes.DWORD()
+            tid_alvo = user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid_alvo))
+            tid_atual = kernel32.GetCurrentThreadId()
+            anexou = False
+            if tid_fg and tid_fg != tid_atual:
+                anexou = bool(user32.AttachThreadInput(tid_atual, tid_fg, True))
+            try:
+                user32.BringWindowToTop(hwnd)
+                # HWND_TOP = 0; SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW = 0x0040|0x0002|0x0001
+                user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0043)
+                user32.SetForegroundWindow(hwnd)
+                user32.SetActiveWindow(hwnd)
+                user32.SetFocus(hwnd)
+            finally:
+                if anexou:
+                    user32.AttachThreadInput(tid_atual, tid_fg, False)
+            time.sleep(0.45)
             return janela_visivel(jid)
         except Exception:
             return False
@@ -271,41 +336,78 @@ def listar_janelas():
         except Exception:
             pass
 
+        GWL_EXSTYLE = -20
+        WS_EX_TOOLWINDOW = 0x00000080
+        WS_EX_APPWINDOW = 0x00040000
+        GW_OWNER = 4
+        ignorar_titulo = (
+            "Program Manager",
+            "Windows Input Experience",
+            "Microsoft Text Input Application",
+            "Experiencia de Introducao do Windows",
+            "Experiência de Introdução do Windows",
+        )
+        ignorar_classe = (
+            "Windows.UI.Core.CoreWindow",
+            "Shell_TrayWnd",
+            "Shell_SecondaryTrayWnd",
+            "Progman",
+            "WorkerW",
+            "NotifyIconOverflowWindow",
+        )
+        ignorar_app = ("textinputhost", "applicationframehost", "systemsettings")
+
         @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
         def enum_windows_callback(hwnd, extra):
             try:
                 if not user32.IsWindowVisible(hwnd):
                     return True
+                if _janela_cloaked(hwnd):
+                    return True
+                # So top-level estilo Alt+Tab (sem dono), salvo AppWindow.
+                owner = user32.GetWindow(hwnd, GW_OWNER)
+                ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+                if owner and not (ex & WS_EX_APPWINDOW):
+                    return True
+                if (ex & WS_EX_TOOLWINDOW) and not (ex & WS_EX_APPWINDOW):
+                    return True
+
+                cls = ctypes.create_unicode_buffer(256)
+                user32.GetClassNameW(hwnd, cls, 256)
+                classe = cls.value or ""
+                if classe in ignorar_classe:
+                    return True
+
                 length = user32.GetWindowTextLengthW(hwnd)
-                if length <= 0:
+                title = ""
+                if length > 0:
+                    buff = ctypes.create_unicode_buffer(length + 1)
+                    user32.GetWindowTextW(hwnd, buff, length + 1)
+                    title = buff.value or ""
+                if any(ig.lower() in title.lower() for ig in ignorar_titulo):
                     return True
-                buff = ctypes.create_unicode_buffer(length + 1)
-                user32.GetWindowTextW(hwnd, buff, length + 1)
-                title = buff.value or ""
-                ignorar = (
-                    "Program Manager",
-                    "Settings",
-                    "Microsoft Text Input Application",
-                    "Windows Input Experience",
-                )
-                if not title or any(ig.lower() in title.lower() for ig in ignorar):
-                    return True
+
                 rect = wintypes.RECT()
                 user32.GetWindowRect(hwnd, ctypes.byref(rect))
                 w = rect.right - rect.left
                 h = rect.bottom - rect.top
-                if w <= 100 or h <= 100:
+                if w < 80 or h < 80:
                     return True
+
                 pid = wintypes.DWORD()
                 user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-                cls = ctypes.create_unicode_buffer(256)
-                user32.GetClassNameW(hwnd, cls, 256)
+                app = _nome_processo(pid.value) or (classe.split(".")[-1] if classe else "app")
+                if app.lower() in ignorar_app:
+                    return True
+                if not title.strip():
+                    title = app
+
                 janelas.append({
                     "id": str(int(hwnd)),
                     "pid": int(pid.value),
                     "titulo": title,
-                    "app": (cls.value or title)[:30],
-                    "classe": cls.value or title,
+                    "app": app[:40],
+                    "classe": classe or app,
                     "x": int(rect.left),
                     "y": int(rect.top),
                     "w": int(w),
@@ -319,7 +421,8 @@ def listar_janelas():
         # Mantem referencia do callback (senao o GC do Python quebra o EnumWindows).
         listar_janelas._cb = enum_windows_callback
         user32.EnumWindows(enum_windows_callback, 0)
-        janelas.sort(key=lambda j: (j["minimizada"], j["titulo"].lower()))
+        # Uma entrada por HWND; ordena app + titulo.
+        janelas.sort(key=lambda j: (j["minimizada"], j["app"].lower(), j["titulo"].lower()))
         return janelas
 
     saida = rodar(["wmctrl", "-l", "-G", "-p", "-x"])
@@ -818,14 +921,18 @@ class Captura:
         self.quedas = 0
         self.dimensoes = ""
         self.pausado_por_janela = False
+        self._modo_janela = "titulo"  # titulo | regiao (fallback Windows)
         threading.Thread(target=self._medidor, daemon=True).start()
         threading.Thread(target=self._vigia_janela, daemon=True).start()
 
     def aplicar(self, novas):
         with self.trava:
+            alvo_antes = self.opcoes.get("alvo")
             for k in PADRAO:
                 if k in novas:
                     self.opcoes[k] = novas[k]
+            if self.opcoes.get("alvo") != alvo_antes:
+                self._modo_janela = "titulo"
             rodando = self.deve_rodar
         self._ajustar_som()
         if rodando:
@@ -853,6 +960,7 @@ class Captura:
             self.falhas = 0
             self.nivel = 0
             self.aviso_nivel = ""
+            self._modo_janela = "titulo"
             self._parar_processo()
             self._iniciar_processo()
 
@@ -903,13 +1011,17 @@ class Captura:
             self.estado = "escolha uma janela"
             return
         tipo, _, ref = self.opcoes["alvo"].partition(":")
-        if tipo == "janela" and not janela_visivel(ref):
-            if not restaurar_janela(ref):
-                self.estado = "janela minimizada"
-                self.erro = ("Essa janela esta minimizada. Restaure ela na tela "
-                             "para poder transmitir.")
-                self.deve_rodar = False
-                return
+        if tipo == "janela":
+            # Sempre traz a janela pra frente antes de capturar.
+            if not janela_visivel(ref):
+                if not restaurar_janela(ref):
+                    self.estado = "janela minimizada"
+                    self.erro = ("Essa janela esta minimizada. Restaure ela na tela "
+                                 "para poder transmitir.")
+                    self.deve_rodar = False
+                    return
+            else:
+                restaurar_janela(ref)
         cmd = self._montar_comando()
         self.dimensoes = "%dx%d" % (NIVEIS[self.nivel]["larg"], NIVEIS[self.nivel]["alt"])
         self.gen += 1
@@ -919,7 +1031,8 @@ class Captura:
         self.erro = ""
         self.velocidade = ""
         self.inicio = time.time()
-        log("captura gen", gen, "nivel", self.nivel, self.codificador)
+        log("captura gen", gen, "nivel", self.nivel, self.codificador,
+            "alvo", self.opcoes["alvo"], "modo", getattr(self, "_modo_janela", ""))
         try:
             kwargs = dict(
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -943,27 +1056,27 @@ class Captura:
 
         if IS_WINDOWS:
             if tipo == "janela":
-                # No Windows, title= do gdigrab e fragil (titulo muda, acentos,
-                # maximizada). Capturamos a regiao da janela no desktop.
+                # Preferir title= (isola a janela). Se falhar / sem titulo,
+                # usa a regiao da janela no desktop (apos focar no _iniciar).
+                janela = next((j for j in listar_janelas()
+                               if str(j["id"]) == str(ref)), None)
+                titulo = titulo_janela(ref) or ((janela or {}).get("titulo") or "")
+                modo = getattr(self, "_modo_janela", "titulo")
                 geo = geometria_janela(ref)
-                if geo:
+                if modo == "titulo" and titulo.strip():
+                    cmd += ["-f", "gdigrab", "-framerate", str(n["fps"]),
+                            "-thread_queue_size", "1024", "-draw_mouse", "0",
+                            "-i", "title=%s" % titulo]
+                elif geo:
                     cmd += ["-f", "gdigrab", "-framerate", str(n["fps"]),
                             "-offset_x", str(geo["x"]), "-offset_y", str(geo["y"]),
                             "-video_size", "%dx%d" % (geo["w"], geo["h"]),
                             "-thread_queue_size", "1024", "-draw_mouse", "0",
                             "-i", "desktop"]
                 else:
-                    janela = next((j for j in listar_janelas()
-                                   if str(j["id"]) == str(ref)), None)
-                    titulo = (janela["titulo"] if janela else "") or titulo_janela(ref)
-                    if titulo:
-                        cmd += ["-f", "gdigrab", "-framerate", str(n["fps"]),
-                                "-thread_queue_size", "1024", "-draw_mouse", "0",
-                                "-i", "title=%s" % titulo]
-                    else:
-                        cmd += ["-f", "gdigrab", "-framerate", str(n["fps"]),
-                                "-thread_queue_size", "1024", "-draw_mouse", "0",
-                                "-i", "desktop"]
+                    cmd += ["-f", "gdigrab", "-framerate", str(n["fps"]),
+                            "-thread_queue_size", "1024", "-draw_mouse", "0",
+                            "-i", "desktop"]
             else:
                 tela = next((t for t in listar_telas() if t["nome"] == ref), None) \
                     or (listar_telas()[0] if listar_telas() else None)
@@ -1218,10 +1331,21 @@ class Captura:
             self.falhas += 1
             pistas = [l for l in self.registro
                       if "rror" in l or "nvalid" in l or "ailed" in l
-                      or "Cannot load" in l or "nvcuda" in l]
+                      or "Cannot load" in l or "nvcuda" in l
+                      or "Can't find window" in l or "Error opening input" in l]
             self.erro = pistas[-1] if pistas else ("ffmpeg saiu com codigo %s" % codigo)
+            # title= do gdigrab falhou: cai para captura por regiao da janela.
+            tipo_alvo, _, _ = self.opcoes.get("alvo", "").partition(":")
+            if (IS_WINDOWS and tipo_alvo == "janela"
+                    and self._modo_janela == "titulo"
+                    and any("Can't find window" in l or "Error opening input" in l
+                            or "I/O error" in l for l in self.registro)):
+                log("title= falhou, caindo para captura por regiao")
+                self._modo_janela = "regiao"
+                self.falhas = 0
+                self.erro = ""
             # GPU encoder listado mas sem driver/CUDA: cai para CPU.
-            if self.codificador in ("nvenc", "amf", "qsv") and self.falhas >= 1:
+            elif self.codificador in ("nvenc", "amf", "qsv") and self.falhas >= 1:
                 log("encoder", self.codificador, "falhou, caindo para CPU (libx264)")
                 self.codificador = "cpu"
                 self.falhas = 0
@@ -1246,14 +1370,17 @@ class Captura:
 
     def _vigia_janela(self):
         geo_cache = None
+        titulo_cache = None
         while True:
             time.sleep(2)
             try:
                 with self.trava:
                     tipo, _, ref = self.opcoes["alvo"].partition(":")
                     rodando, pausado = self.deve_rodar, self.pausado_por_janela
+                    modo = getattr(self, "_modo_janela", "titulo")
                 if tipo != "janela" or not (rodando or pausado):
                     geo_cache = None
+                    titulo_cache = None
                     continue
                 situacao = estado_janela(ref)
                 with self.trava:
@@ -1263,6 +1390,7 @@ class Captura:
                         self.erro = ""
                         self.falhas = 0
                         geo_cache = None
+                        titulo_cache = None
                         log("janela voltou, retomando")
                         self._parar_processo()
                         self._iniciar_processo()
@@ -1271,6 +1399,7 @@ class Captura:
                         self.deve_rodar = False
                         self._parar_processo()
                         geo_cache = None
+                        titulo_cache = None
                         if situacao == "sumiu":
                             self.estado = "janela fechada"
                             self.erro = "Essa janela foi fechada. Escolha outra na lista."
@@ -1280,10 +1409,19 @@ class Captura:
                             self.erro = ("A janela saiu da tela. Restaure ela e a "
                                          "transmissao volta sozinha.")
                     elif situacao == "visivel" and rodando and IS_WINDOWS:
-                        # Se a janela moveu/redimensionou, reinicia a captura
-                        # na nova regiao (no Linux o x11grab usa window_id).
+                        if modo == "titulo":
+                            tit = titulo_janela(ref)
+                            if titulo_cache is None:
+                                titulo_cache = tit
+                            elif tit and tit != titulo_cache:
+                                log("titulo da janela mudou, recapturando")
+                                titulo_cache = tit
+                                geo_cache = None
+                                self._parar_processo()
+                                self._iniciar_processo()
+                                continue
                         geo = geometria_janela(ref)
-                        if geo and geo_cache and geo != geo_cache:
+                        if modo == "regiao" and geo and geo_cache and geo != geo_cache:
                             log("janela moveu, ajustando captura",
                                 "%(w)dx%(h)d+%(x)d+%(y)d" % geo)
                             self._parar_processo()
@@ -1577,7 +1715,7 @@ transition:background .2s}
 .cx{background:var(--cx);border:1px solid var(--bd);border-radius:12px;
 padding:16px;margin-bottom:14px}
 .lin{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-.jn{max-height:320px;min-height:120px;overflow:auto;border:1px solid var(--bd);border-radius:9px}
+.jn{max-height:420px;min-height:160px;overflow:auto;border:1px solid var(--bd);border-radius:9px}
 .jn div{padding:12px;cursor:pointer;border-bottom:1px solid var(--bd);
 display:flex;justify-content:space-between;gap:10px;align-items:center;
 transition:background .12s}
@@ -1585,7 +1723,10 @@ transition:background .12s}
 .jn div:hover{background:var(--sel)}
 .jn div.sel{background:var(--ac);color:#fff}
 .jn small{opacity:.75;flex:none;font-size:12px}
-.jn span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.jn span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.jn .meta{display:flex;flex-direction:column;gap:2px;min-width:0;flex:1}
+.jn .meta em{font-style:normal;font-size:12px;opacity:.7}
+#busca-janela{width:100%;margin-bottom:8px}
 .lnk{display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap}
 .lnk input{font-family:ui-monospace,monospace;font-size:13px;flex:1;min-width:220px}
 .lnk a.url{flex:1;min-width:220px;word-break:break-all;color:var(--ac);font-size:14px;
@@ -1618,10 +1759,12 @@ padding:7px 11px;font-size:14.5px;animation:ap .2s ease}
 
     <div class="cx">
     <h2>O que transmitir <span class="mut" id="contagem"></span></h2>
+    <input type="search" id="busca-janela" placeholder="Buscar janela pelo nome..."
+           autocomplete="off" oninput="filtrarJanelas()">
     <div class="jn" id="jn"><div>Carregando janelas...</div></div>
     <div class="lin" style="margin-top:10px">
       <button type="button" id="btn-atualizar" onclick="listar(true)">Atualizar lista</button>
-      <span class="mut">Clique na janela ou tela que quer mostrar.</span>
+      <span class="mut">Clique na janela especifica (ou na tela inteira) e depois em Comecar.</span>
     </div>
   </div>
 
@@ -1680,7 +1823,7 @@ padding:7px 11px;font-size:14.5px;animation:ap .2s ease}
 <script>
 const D = __DADOS__;
 const $ = i => document.getElementById(i);
-let est = {}, alvo = "", assinaturas = {}, ultimoChat = 0;
+let est = {}, alvo = "", assinaturas = {}, ultimoChat = 0, itensFontes = [];
 
 function api(rota, corpo){
   const sep = rota.indexOf("?") >= 0 ? "&" : "?";
@@ -1697,6 +1840,58 @@ function ocupado(btn, promessa){
   return promessa.finally(() => { btn.disabled = false; });
 }
 
+function rotuloJanela(j){
+  const app = (j.app || "").trim();
+  const tit = (j.titulo || "").trim();
+  if (app && tit && tit.toLowerCase() !== app.toLowerCase()
+      && !tit.toLowerCase().startsWith(app.toLowerCase()))
+    return app + " · " + tit;
+  return tit || app || "Janela";
+}
+
+function pintarListaJanelas(){
+  const jn = $("jn");
+  if (!jn) return;
+  const q = (($("busca-janela") && $("busca-janela").value) || "").trim().toLowerCase();
+  const filtrados = !q ? itensFontes : itensFontes.filter(it =>
+    (it.t + " " + (it.app || "") + " " + it.s).toLowerCase().indexOf(q) >= 0);
+  jn.innerHTML = "";
+  filtrados.forEach(it => {
+    const el = document.createElement("div");
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    const span = document.createElement("span");
+    span.textContent = it.t;
+    meta.appendChild(span);
+    if (it.app && it.tipo === "janela"){
+      const em = document.createElement("em");
+      em.textContent = it.app;
+      meta.appendChild(em);
+    }
+    const small = document.createElement("small");
+    small.textContent = it.s;
+    el.appendChild(meta);
+    el.appendChild(small);
+    if (it.min) el.style.opacity = ".55";
+    if (it.v === alvo) el.className = "sel";
+    el.onclick = () => {
+      alvo = it.v;
+      [...jn.children].forEach(c => c.className = "");
+      el.className = "sel";
+      assinaturas.jn = null;
+      api("/api/opcoes", {alvo: alvo}).then(pintar);
+    };
+    jn.appendChild(el);
+  });
+  if (!filtrados.length){
+    jn.innerHTML = q
+      ? "<div>Nenhuma janela com \"" + q.replace(/[<>&]/g, "") + "\"</div>"
+      : "<div>Nenhuma janela aberta. Abra o app e clique em Atualizar lista.</div>";
+  }
+}
+
+function filtrarJanelas(){ pintarListaJanelas(); }
+
 function listar(forcar){
   return api("/api/fontes", {}).then(d => {
     if (!d || !Array.isArray(d.telas) || !Array.isArray(d.janelas)){
@@ -1705,33 +1900,18 @@ function listar(forcar){
       return;
     }
     const itens = [];
-    d.telas.forEach(t => itens.push({v:"tela:"+t.nome,
-      t:"Tela inteira (" + (t.rotulo || t.nome) + ")", s:t.w + "x" + t.h}));
-    d.janelas.forEach(j => itens.push({v:"janela:"+j.id, t:j.titulo || j.app,
+    d.telas.forEach(t => itens.push({v:"tela:"+t.nome, tipo:"tela",
+      t:"Tela inteira (" + (t.rotulo || t.nome) + ")", s:t.w + "x" + t.h, app:""}));
+    d.janelas.forEach(j => itens.push({v:"janela:"+j.id, tipo:"janela",
+      t: rotuloJanela(j), app: j.app || "",
       s:(j.minimizada ? "minimizada  " : "") + (j.w + "x" + j.h), min:j.minimizada}));
+    itensFontes = itens;
     const cont = $("contagem");
     if (cont) cont.textContent = "(" + d.janelas.length + " janelas)";
-    const assina = JSON.stringify(itens) + "|" + alvo;
+    const assina = JSON.stringify(itens.map(i => i.v + ":" + i.t)) + "|" + alvo;
     if (forcar || assinaturas.jn !== assina){
       assinaturas.jn = assina;
-      const jn = $("jn"); jn.innerHTML = "";
-      itens.forEach(it => {
-        const el = document.createElement("div");
-        el.innerHTML = "<span></span><small></small>";
-        el.firstChild.textContent = it.t;
-        el.lastChild.textContent = it.s;
-        if (it.min) el.style.opacity = ".55";
-        if (it.v === alvo) el.className = "sel";
-        el.onclick = () => {
-          alvo = it.v;
-          [...jn.children].forEach(c => c.className = "");
-          el.className = "sel";
-          assinaturas.jn = null;
-          api("/api/opcoes", {alvo: alvo}).then(pintar);
-        };
-        jn.appendChild(el);
-      });
-      if (!itens.length) jn.innerHTML = "<div>Nenhuma janela aberta</div>";
+      pintarListaJanelas();
     }
     const assinaM = JSON.stringify(d.microfones || []);
     if (forcar || assinaturas.mic !== assinaM){
