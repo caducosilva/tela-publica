@@ -1585,7 +1585,9 @@ transition:background .12s}
 .jn small{opacity:.75;flex:none;font-size:12px}
 .jn span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .lnk{display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap}
-.lnk input{font-family:ui-monospace,monospace;font-size:13px;flex:1;min-width:180px}
+.lnk input{font-family:ui-monospace,monospace;font-size:13px;flex:1;min-width:220px}
+.lnk a.url{flex:1;min-width:220px;word-break:break-all;color:var(--ac);font-size:14px;
+font-family:ui-monospace,monospace;text-decoration:underline}
 .mut{color:var(--mut);font-size:13.5px}
 .er{color:var(--er);font-size:13.5px}
 .aviso{border:1px solid var(--er);border-radius:12px;padding:14px;margin-bottom:14px}
@@ -1622,6 +1624,12 @@ padding:7px 11px;font-size:14.5px;animation:ap .2s ease}
   </div>
 
   <div class="cx">
+    <h2>Link para quem vai assistir</h2>
+    <div id="tunel"><div class="mut">Preparando o link...</div></div>
+    <div id="diretos"></div>
+  </div>
+
+  <div class="cx">
     <h2>Som</h2>
     <div class="mut" id="som-info"></div>
     <div class="mic" style="margin-top:12px">
@@ -1633,12 +1641,6 @@ padding:7px 11px;font-size:14.5px;animation:ap .2s ease}
   <div class="cx">
     <h2>Qualidade</h2>
     <div class="q" id="q"></div>
-  </div>
-
-  <div class="cx">
-    <h2>Link para quem vai assistir</h2>
-    <div id="tunel"></div>
-    <div id="diretos"></div>
   </div>
 
   <div class="cx">
@@ -1767,21 +1769,31 @@ function encerrar(btn){
 function caixaLink(url, publico){
   const cx = document.createElement("div");
   cx.className = "lnk";
-  const i = document.createElement("input");
-  i.type = "text"; i.readOnly = true; i.value = url;
-  i.onclick = () => i.select();
+  const a = document.createElement("a");
+  a.className = "url";
+  a.href = url;
+  a.target = "_blank";
+  a.rel = "noopener";
+  a.textContent = url;
   const b = document.createElement("button");
   b.textContent = "Copiar";
   b.onclick = () => {
-    navigator.clipboard.writeText(url);
-    b.textContent = "Copiado";
-    setTimeout(() => b.textContent = "Copiar", 1500);
+    const ok = () => {
+      b.textContent = "Copiado";
+      setTimeout(() => b.textContent = "Copiar", 1500);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText)
+      navigator.clipboard.writeText(url).then(ok).catch(() => {
+        window.prompt("Copie o link:", url); ok();
+      });
+    else { window.prompt("Copie o link:", url); ok(); }
   };
-  cx.appendChild(i); cx.appendChild(b);
+  cx.appendChild(a); cx.appendChild(b);
   if (publico){
     const w = document.createElement("button");
     w.textContent = "WhatsApp";
-    w.onclick = () => window.open("https://wa.me/?text=" + encodeURIComponent(url), "_blank");
+    w.onclick = () => window.open("https://wa.me/?text=" + encodeURIComponent(
+      "Assiste aqui: " + url), "_blank");
     cx.appendChild(w);
   }
   return cx;
@@ -1795,18 +1807,18 @@ function pintarLinks(){
   const m = document.createElement("div");
   m.className = "mut";
   if (est.url_publica){
-    m.textContent = "Funciona de qualquer lugar, sem mexer no roteador.";
+    m.textContent = "Mande este link. Funciona de qualquer lugar.";
     t.appendChild(m);
     t.appendChild(caixaLink(est.url_publica, true));
   } else if (est.tunel === "conectando"){
-    m.textContent = "Abrindo o tunel...";
+    m.textContent = "Abrindo o link publico... aguarde uns segundos.";
     t.appendChild(m);
   } else if (est.tunel_disponivel){
     m.textContent = "Sem link publico ativo. ";
-    const a = document.createElement("button");
-    a.textContent = "Ligar agora";
-    a.onclick = () => ocupado(a, api("/api/tunel").then(pintar));
-    m.appendChild(a);
+    const btn = document.createElement("button");
+    btn.textContent = "Gerar link agora";
+    btn.onclick = () => ocupado(btn, api("/api/tunel", {}).then(pintar));
+    m.appendChild(btn);
     t.appendChild(m);
   } else {
     m.textContent = "Para gerar link de fora da sua rede, instale o cloudflared: " +
@@ -1817,7 +1829,7 @@ function pintarLinks(){
   dd.innerHTML = "";
   const m2 = document.createElement("div");
   m2.className = "mut"; m2.style.marginTop = "14px";
-  m2.textContent = "Na mesma rede de casa:";
+  m2.textContent = "Na mesma rede Wi-Fi de casa:";
   dd.appendChild(m2);
   (est.urls_diretas||[]).forEach(u => dd.appendChild(caixaLink(u, false)));
 }
