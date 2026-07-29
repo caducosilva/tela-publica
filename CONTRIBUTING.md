@@ -25,7 +25,7 @@ Obrigado por considerar contribuir. Este projeto é mantido por uma pessoa só, 
 - Uma classe por responsabilidade, nomes em `PascalCase`
 - Funções e variáveis em `snake_case`
 - Docstrings em português nas classes públicas
-- Logs técnicos em `log()` — nunca misturar com conteúdo do chat
+- Logs técnicos em `log()`, nunca misturados com conteúdo do chat
 - Paths absolutos via `os.path.expanduser` ou `pathlib.Path.home()`
 - Sem dependências externas além das listadas em `DEPENDENCIAS`
 
