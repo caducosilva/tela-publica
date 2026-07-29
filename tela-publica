@@ -726,15 +726,17 @@ class Chat:
 
     def enviar(self, quem, nome, texto):
         agora = time.time()
-        nome = limpar_texto(nome, self.MAX_NOME) or "convidado"
+        nome = limpar_texto(nome, self.MAX_NOME)
         texto = limpar_texto(texto, self.MAX_TEXTO)
         with self.trava:
             self._limpar(agora)
+            if len(nome) < 2:
+                return False, "Escolha um nome antes de mandar mensagem.", 0
             if not texto:
                 return False, "Escreva alguma coisa.", 0
             espera = self.INTERVALO - (agora - self.ultimo_envio.get(quem, 0))
             if espera > 0:
-                return False, "Espere um pouco para mandar de novo.", int(espera) + 1
+                return False, "Espere %d s para mandar de novo." % (int(espera) + 1), int(espera) + 1
             self.ultimo_envio[quem] = agora
             self.sequencia += 1
             self.mensagens.append({"id": self.sequencia, "nome": nome,
@@ -1646,13 +1648,20 @@ padding:7px 11px;font-size:14.5px;animation:ap .2s ease}
   <div class="cx">
     <h2>Chat</h2>
     <div id="msgs"></div>
-    <div class="lin">
-      <input type="text" id="apelido" placeholder="seu apelido" maxlength="20"
-             style="max-width:150px">
+    <div id="chat-gate" class="lin" style="flex-direction:column;align-items:stretch">
+      <div class="mut">Escolha um nome para usar o chat.</div>
+      <div class="lin">
+        <input type="text" id="apelido" placeholder="seu nome" maxlength="20"
+               style="flex:1;min-width:160px">
+        <button type="button" onclick="salvarNomePainel()">Entrar</button>
+      </div>
+    </div>
+    <div id="chat-form" class="lin" style="display:none">
       <input type="text" id="texto" placeholder="escreva e aperte Enter"
              maxlength="200" style="flex:1;min-width:160px">
       <button onclick="mandar(this)">Enviar</button>
     </div>
+    <div class="mut" id="chat-aviso" style="margin-top:6px"></div>
   </div>
 
   <div class="cx">
@@ -1807,7 +1816,9 @@ function pintarLinks(){
   const m = document.createElement("div");
   m.className = "mut";
   if (est.url_publica){
-    m.textContent = "Mande este link. Funciona de qualquer lugar.";
+    m.textContent = est.rodando
+      ? "Mande este link. Funciona de qualquer lugar."
+      : "Link pronto. Clique em Comecar acima para a imagem aparecer para quem assistir.";
     t.appendChild(m);
     t.appendChild(caixaLink(est.url_publica, true));
   } else if (est.tunel === "conectando"){
@@ -1921,21 +1932,45 @@ function puxarChat(){
   }).catch(()=>{});
 }
 
+function salvarNomePainel(){
+  const n = ($("apelido").value || "").trim();
+  if (n.length < 2){
+    $("chat-aviso").textContent = "Use pelo menos 2 letras.";
+    return;
+  }
+  localStorage.setItem("tp_apelido", n);
+  $("chat-aviso").textContent = "";
+  $("chat-gate").style.display = "none";
+  $("chat-form").style.display = "flex";
+  $("texto").focus();
+}
 function mandar(btn){
+  const nome = ($("apelido").value || localStorage.getItem("tp_apelido") || "").trim();
   const texto = $("texto").value.trim();
+  if (nome.length < 2){
+    $("chat-aviso").textContent = "Escolha um nome antes.";
+    $("chat-gate").style.display = "flex";
+    $("chat-form").style.display = "none";
+    return;
+  }
   if (!texto) return;
-  const nome = $("apelido").value.trim() || "anfitriao";
-  localStorage.setItem("tp_apelido", nome);
   return ocupado(btn, api("/api/chat", {nome: nome, texto: texto}).then(d => {
-    if (d.ok){ $("texto").value = ""; puxarChat(); }
-    else $("chat-aviso").textContent = d.erro;
+    if (d.ok){ $("texto").value = ""; $("chat-aviso").textContent = ""; puxarChat(); }
+    else $("chat-aviso").textContent = d.erro + (d.espera ? " (" + d.espera + "s)" : "");
   }));
 }
-
 $("texto").addEventListener("keydown", ev => {
   if (ev.key === "Enter") mandar();
 });
-$("apelido").value = localStorage.getItem("tp_apelido") || "";
+$("apelido").addEventListener("keydown", ev => {
+  if (ev.key === "Enter") salvarNomePainel();
+});
+const nomeSalvo = localStorage.getItem("tp_apelido") || "";
+$("apelido").value = nomeSalvo;
+if (nomeSalvo.trim().length >= 2){
+  $("chat-gate").style.display = "none";
+  $("chat-form").style.display = "flex";
+}
 
 listar(true);
 api("/api/estado", {}).then(pintar);
@@ -1951,82 +1986,126 @@ setInterval(() => api("/api/ping", {}), 5000);
 PAGINA_VISOR = PAGINA_BASE + """
 <title>Transmissao ao vivo</title>
 <style>
-html,body{height:100%;background:#000;color:#eee;overflow:hidden}
-body{display:flex;align-items:center;justify-content:center}
-video{width:100%;height:100%;object-fit:contain;background:#000}
-#capa{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;
-justify-content:center;gap:18px;background:#000;text-align:center;padding:24px;z-index:5}
-#capa button{background:#fff;color:#111;border:0;border-radius:999px;
-padding:16px 42px;font-size:17px;font-weight:600;min-height:54px}
-#capa button:active{transform:scale(.95);background:#ddd}
-#barra{position:fixed;top:0;right:0;padding:12px;display:flex;gap:8px;z-index:3;
+html,body{height:100%;margin:0;background:#0c0c0c;color:#eee;overflow:hidden}
+body{display:flex;height:100%}
+#palco{flex:1;min-width:0;position:relative;background:#111;display:flex;
+align-items:center;justify-content:center}
+video{width:100%;height:100%;object-fit:contain;background:#111}
+#chat{width:min(340px,100%);max-width:100%;height:100%;display:flex;flex-direction:column;
+background:#141414;border-left:1px solid #2a2a2a;z-index:4;flex:none}
+#chat h2{margin:0;padding:14px 16px 10px;font-size:13px;letter-spacing:.06em;
+text-transform:uppercase;color:#9a9a96;border-bottom:1px solid #2a2a2a}
+#lista{flex:1;overflow:auto;padding:12px;display:flex;flex-direction:column;gap:8px}
+#lista .msg{background:#1c1c1b;border:1px solid #2e2e2c;border-radius:10px;
+padding:8px 11px;font-size:14.5px;word-break:break-word;animation:ap .2s ease}
+#lista .msg b{color:#5fb98a;margin-right:6px}
+#lista .msg.saindo{opacity:0;transition:opacity .8s}
+@keyframes ap{from{opacity:0;transform:translateY(6px)}to{opacity:1}}
+#gate,#form{padding:12px 14px 16px;border-top:1px solid #2a2a2a;display:flex;
+flex-direction:column;gap:8px}
+#gate input,#form input{background:#1c1c1b;border:1px solid #2e2e2c;color:#fff;
+border-radius:9px;padding:11px 13px;min-height:44px;width:100%}
+#gate button,#form button{background:#5fb98a;color:#0c0c0c;border:0;border-radius:9px;
+padding:12px 16px;font-weight:600;min-height:44px;cursor:pointer}
+#form .lin{display:flex;gap:8px}
+#form .lin input{flex:1}
+#form button{flex:none}
+#chat-aviso{font-size:12.5px;color:#e0796d;min-height:1.2em}
+#espera{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;
+justify-content:center;gap:12px;background:#111;text-align:center;padding:28px;z-index:2}
+#espera.ok{display:none}
+#espera .t{font-size:20px;font-weight:600}
+#espera .s{font-size:14.5px;color:#9a9a96;max-width:360px;line-height:1.45}
+#barra{position:absolute;top:0;right:0;padding:12px;display:flex;gap:8px;z-index:3;
 opacity:0;transition:opacity .25s}
 #barra.on{opacity:1}
 #barra button{background:#000a;color:#fff;border:1px solid #fff3;border-radius:999px;
 padding:11px 18px;font-size:14px;backdrop-filter:blur(8px);min-height:44px}
-#aviso{position:fixed;top:14px;left:50%;transform:translateX(-50%);background:#000a;
+#aviso{position:absolute;top:14px;left:50%;transform:translateX(-50%);background:#000a;
 padding:8px 15px;border-radius:999px;font-size:13px;opacity:0;transition:.3s;
 pointer-events:none;backdrop-filter:blur(6px);z-index:6}
 #aviso.on{opacity:1}
-#chat{position:fixed;left:0;bottom:0;width:min(360px,100%);padding:12px;z-index:4;
-display:flex;flex-direction:column;gap:8px;pointer-events:none}
-#lista{display:flex;flex-direction:column;gap:6px;max-height:38vh;overflow:hidden;
-justify-content:flex-end}
-#lista div{background:#000000b3;border-radius:10px;padding:7px 11px;font-size:14.5px;
-backdrop-filter:blur(8px);animation:ap .2s ease;word-break:break-word}
-#lista div b{color:#7fd6a8;margin-right:6px}
-#lista div.saindo{opacity:0;transition:opacity .8s}
-@keyframes ap{from{opacity:0;transform:translateY(6px)}to{opacity:1}}
-#form{display:flex;gap:7px;pointer-events:auto;opacity:.55;transition:opacity .2s}
-#form:focus-within,#form.on{opacity:1}
-#form input{background:#000000b3;border:1px solid #fff3;color:#fff;border-radius:999px;
-padding:10px 15px;min-height:44px;backdrop-filter:blur(8px)}
-#form input::placeholder{color:#fff8}
-#nome{max-width:110px}
-#form button{background:#fffffff2;color:#111;border:0;border-radius:999px;
-padding:10px 17px;font-weight:600;min-height:44px}
-@media (max-width:560px){#chat{width:100%}#lista{max-height:30vh}}
+@media (max-width:800px){
+  body{flex-direction:column}
+  #palco{flex:1;min-height:42vh}
+  #chat{width:100%;height:min(48vh,420px);border-left:0;border-top:1px solid #2a2a2a}
+}
 </style>
-<video id="v" playsinline controls></video>
-<div id="barra"><button id="bfs" onclick="telaCheia()">Tela cheia</button></div>
-<div id="aviso"></div>
-<div id="chat">
-  <div id="lista"></div>
-  <div id="form">
-    <input type="text" id="nome" placeholder="apelido" maxlength="20">
-    <input type="text" id="texto" placeholder="mandar mensagem" maxlength="200"
-           style="flex:1">
-    <button onclick="mandar()">Ok</button>
+<div id="palco">
+  <video id="v" playsinline></video>
+  <div id="espera">
+    <div class="t">Aguardando a transmissao</div>
+    <div class="s" id="espera-msg">O anfitriao ainda nao clicou em Comecar.
+      Esta pagina atualiza sozinha.</div>
   </div>
+  <div id="barra"><button id="bfs" type="button" onclick="telaCheia()">Tela cheia</button></div>
+  <div id="aviso"></div>
 </div>
-<div id="capa">
-  <div style="font-size:15px;opacity:.8">Transmissao ao vivo</div>
-  <button onclick="comecar()">Assistir</button>
-</div>
+<aside id="chat">
+  <h2>Chat</h2>
+  <div id="lista"></div>
+  <div id="gate">
+    <div class="s" style="color:#9a9a96;font-size:13.5px">Escolha um nome para participar do chat.</div>
+    <input type="text" id="nome-novo" placeholder="seu nome" maxlength="20" autocomplete="nickname">
+    <button type="button" id="btn-nome" onclick="salvarNome()">Entrar no chat</button>
+    <div id="chat-aviso"></div>
+  </div>
+  <div id="form" style="display:none">
+    <div class="mut" style="font-size:12.5px;color:#9a9a96">Enviando como <b id="nome-ativo"></b>
+      · max. 1 msg / 5 s</div>
+    <div class="lin">
+      <input type="text" id="texto" placeholder="escreva uma mensagem" maxlength="200">
+      <button type="button" onclick="mandar()">Enviar</button>
+    </div>
+    <div id="chat-aviso2" class="s" style="color:#e0796d;font-size:12.5px;min-height:1.2em"></div>
+  </div>
+</aside>
 <script>
 const T = location.pathname.split("/").pop();
 const v = document.getElementById("v");
 const MS = window.ManagedMediaSource || window.MediaSource;
-let ms, sb, fila = [], ativo = true, ultimoChat = 0;
+let ms, sb, fila = [], ativo = true, ultimoChat = 0, conectando = false, meuNome = "";
 
 function aviso(t){
   const a = document.getElementById("aviso");
-  a.textContent = t; a.className = t ? "on" : "";
+  a.textContent = t || ""; a.className = t ? "on" : "";
+}
+function mostrarEspera(msg){
+  const e = document.getElementById("espera");
+  e.className = "";
+  if (msg) document.getElementById("espera-msg").textContent = msg;
+}
+function esconderEspera(){
+  document.getElementById("espera").className = "ok";
 }
 
-function comecar(){
-  document.getElementById("capa").style.display = "none";
-  v.play().catch(() => {});
-  mostrarBarra();
+function atualizarGate(){
+  meuNome = (localStorage.getItem("tp_apelido") || "").trim();
+  const gate = document.getElementById("gate");
+  const form = document.getElementById("form");
+  if (meuNome.length >= 2){
+    gate.style.display = "none";
+    form.style.display = "flex";
+    document.getElementById("nome-ativo").textContent = meuNome;
+  } else {
+    gate.style.display = "flex";
+    form.style.display = "none";
+  }
 }
-v.addEventListener("playing", () => {
-  document.getElementById("capa").style.display = "none";
-});
+function salvarNome(){
+  const n = document.getElementById("nome-novo").value.trim();
+  const av = document.getElementById("chat-aviso");
+  if (n.length < 2){ av.textContent = "Use pelo menos 2 letras."; return; }
+  localStorage.setItem("tp_apelido", n);
+  av.textContent = "";
+  atualizarGate();
+  document.getElementById("texto").focus();
+}
 
 async function telaCheia(){
   try{
     if (!document.fullscreenElement && !document.webkitFullscreenElement){
-      const alvo = document.documentElement;
+      const alvo = document.getElementById("palco");
       if (alvo.requestFullscreen) await alvo.requestFullscreen({navigationUI:"hide"});
       else if (alvo.webkitRequestFullscreen) alvo.webkitRequestFullscreen();
       else if (v.webkitEnterFullscreen){ v.webkitEnterFullscreen(); return; }
@@ -2039,7 +2118,6 @@ async function telaCheia(){
   }catch(e){}
   atualizarBotao();
 }
-
 function atualizarBotao(){
   const cheio = !!(document.fullscreenElement || document.webkitFullscreenElement);
   document.getElementById("bfs").textContent = cheio ? "Sair da tela cheia" : "Tela cheia";
@@ -2054,7 +2132,6 @@ v.addEventListener("click", () => {
   ultimoToque = agora;
   mostrarBarra();
 });
-
 let sumir;
 function mostrarBarra(){
   const b = document.getElementById("barra");
@@ -2066,17 +2143,25 @@ document.addEventListener("mousemove", mostrarBarra);
 document.addEventListener("touchstart", mostrarBarra, {passive:true});
 
 async function conectar(){
-  if (!ativo) return;
+  if (!ativo || conectando) return;
+  conectando = true;
   try{
-    const r = await fetch("/stream?t=" + T, {cache:"no-store"});
+    const r = await fetch("/stream?t=" + encodeURIComponent(T), {cache:"no-store"});
     if (!r.ok){
-      aviso(r.status === 404 ? "Aguardando comecar" : "Sem acesso");
-      return setTimeout(conectar, 2500);
+      mostrarEspera(r.status === 404
+        ? "O anfitriao ainda nao clicou em Comecar. Esta pagina atualiza sozinha."
+        : "Sem acesso a esta transmissao.");
+      conectando = false;
+      setTimeout(conectar, 2500);
+      return;
     }
     const mime = r.headers.get("X-Mime") || 'video/mp4; codecs="avc1.64002A"';
     if (!MS || !MS.isTypeSupported(mime)){
-      return aviso("Este navegador nao consegue tocar a transmissao");
+      mostrarEspera("Este navegador nao consegue tocar a transmissao.");
+      conectando = false;
+      return;
     }
+    if (v.src) { try { URL.revokeObjectURL(v.src); } catch(e){} }
     ms = new MS();
     v.disableRemotePlayback = true;
     if (window.ManagedMediaSource && ms instanceof window.ManagedMediaSource){
@@ -2084,11 +2169,17 @@ async function conectar(){
     } else {
       v.src = URL.createObjectURL(ms);
     }
-    await new Promise(ok => ms.addEventListener("sourceopen", ok, {once:true}));
+    await new Promise((ok, err) => {
+      const t = setTimeout(() => err(new Error("timeout sourceopen")), 8000);
+      ms.addEventListener("sourceopen", () => { clearTimeout(t); ok(); }, {once:true});
+    });
     sb = ms.addSourceBuffer(mime);
+    sb.mode = "segments";
     sb.addEventListener("updateend", () => { alinhar(); bombear(); });
     fila = [];
     aviso("");
+    esconderEspera();
+    v.play().catch(()=>{});
     const leitor = r.body.getReader();
     while (true){
       const {done, value} = await leitor.read();
@@ -2096,12 +2187,13 @@ async function conectar(){
       fila.push(value);
       bombear();
     }
-  }catch(e){}
-  finally{
-    try{ ms && ms.readyState === "open" && ms.endOfStream(); }catch(e){}
-    sb = null;
-    if (ativo){ aviso("Reconectando"); setTimeout(conectar, 800); }
+    mostrarEspera("Transmissao pausada. Reconectando...");
+  }catch(e){
+    mostrarEspera("Reconectando...");
   }
+  try{ if (ms && ms.readyState === "open") ms.endOfStream(); }catch(e){}
+  sb = null; ms = null; conectando = false;
+  if (ativo) setTimeout(conectar, 1200);
 }
 
 function alinhar(){
@@ -2112,7 +2204,6 @@ function alinhar(){
     v.currentTime = Math.max(b.start(0), b.end(b.length - 1) - 1.2);
   }
 }
-
 function bombear(){
   if (!sb || sb.updating || !fila.length) return;
   let n = 0;
@@ -2121,9 +2212,8 @@ function bombear(){
   let off = 0;
   for (const p of fila){ juntos.set(p, off); off += p.byteLength; }
   fila = [];
-  try{
-    sb.appendBuffer(juntos);
-  }catch(e){
+  try{ sb.appendBuffer(juntos); }
+  catch(e){
     if (e.name === "QuotaExceededError"){
       try{
         const b = sb.buffered;
@@ -2133,7 +2223,6 @@ function bombear(){
   }
   if (v.paused && v.readyState >= 2) v.play().catch(()=>{});
 }
-
 setInterval(() => {
   if (!sb || sb.updating) return;
   const b = sb.buffered;
@@ -2147,6 +2236,7 @@ setInterval(() => {
   }
 }, 3000);
 
+v.addEventListener("playing", () => esconderEspera());
 v.addEventListener("error", () => { if (ativo) aviso("Erro no video"); });
 
 setInterval(() => {
@@ -2155,50 +2245,54 @@ setInterval(() => {
     const b = v.buffered;
     if (b.length) buf = b.end(b.length - 1) - v.currentTime;
   }catch(e){}
-  fetch("/sinal?t=" + T, {method:"POST", headers:{"Content-Type":"application/json"},
+  fetch("/sinal?t=" + encodeURIComponent(T), {method:"POST",
+    headers:{"Content-Type":"application/json"},
     body: JSON.stringify({tocando: !v.paused && v.readyState >= 3, buffer: buf})
   }).catch(()=>{});
 }, 4000);
 
 function adicionar(m){
+  const lista = document.getElementById("lista");
   const el = document.createElement("div");
+  el.className = "msg";
   const b = document.createElement("b");
   b.textContent = m.nome;
   el.appendChild(b);
   el.appendChild(document.createTextNode(m.texto));
-  document.getElementById("lista").appendChild(el);
-  setTimeout(() => { el.className = "saindo";
+  lista.appendChild(el);
+  lista.scrollTop = lista.scrollHeight;
+  setTimeout(() => { el.className = "msg saindo";
     setTimeout(() => el.remove(), 800); }, Math.max(1, m.resta) * 1000);
 }
-
 function puxarChat(){
-  fetch("/chat?t=" + T + "&desde=" + ultimoChat)
+  fetch("/chat?t=" + encodeURIComponent(T) + "&desde=" + ultimoChat)
     .then(r => r.json())
     .then(d => { ultimoChat = d.ultimo; (d.mensagens || []).forEach(adicionar); })
     .catch(()=>{});
 }
-
 function mandar(){
+  if (meuNome.length < 2){ atualizarGate(); return; }
   const campo = document.getElementById("texto");
   const texto = campo.value.trim();
+  const av = document.getElementById("chat-aviso2");
   if (!texto) return;
-  const nome = document.getElementById("nome").value.trim() || "convidado";
-  localStorage.setItem("tp_apelido", nome);
-  fetch("/chat?t=" + T, {method:"POST", headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({nome: nome, texto: texto})
+  fetch("/chat?t=" + encodeURIComponent(T), {method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({nome: meuNome, texto: texto})
   }).then(r => r.json()).then(d => {
-    if (d.ok){ campo.value = ""; puxarChat(); }
-    else aviso(d.erro);
-  }).catch(()=>{});
+    if (d.ok){ campo.value = ""; av.textContent = ""; puxarChat(); }
+    else av.textContent = d.erro + (d.espera ? " (" + d.espera + "s)" : "");
+  }).catch(()=>{ av.textContent = "Falha ao enviar."; });
 }
-
 document.getElementById("texto").addEventListener("keydown", ev => {
   if (ev.key === "Enter") mandar();
 });
-document.getElementById("nome").value = localStorage.getItem("tp_apelido") || "";
-
-setInterval(puxarChat, 2000);
+document.getElementById("nome-novo").addEventListener("keydown", ev => {
+  if (ev.key === "Enter") salvarNome();
+});
+atualizarGate();
 atualizarBotao();
+setInterval(puxarChat, 2000);
 conectar();
 </script>
 """
