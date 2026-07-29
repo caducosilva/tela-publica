@@ -1,26 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-tela-publica
+tela-publica (Windows 10/11 & Linux Compatible)
 Transmite uma janela do seu computador para alguem assistir pelo navegador,
 de qualquer lugar, sem instalar nada do outro lado.
 
-Ideias centrais:
-
-  Imagem   Sempre 1920x1080 a 30 fps. A janela entra centralizada nesse
-           quadro, entao a resolucao nunca muda no meio da transmissao.
-
-  Som      Sai apenas do programa da janela escolhida. Quem esta no
-           computador continua ouvindo tudo normalmente. O microfone entra
-           so quando o dono liga, para avisar alguma coisa.
-
-  Chat     Existe so na memoria. Nada vai para disco, nada fica gravado, e
-           cada mensagem some sozinha um minuto depois.
-
 Criado por caducosilva. Contato: abobicarlo@gmail.com
+Atualizado com suporte completo a Windows 10/11.
 """
 
 import atexit
+import ctypes
+from ctypes import wintypes
 import http.server
 import json
 import os
@@ -36,24 +27,49 @@ import time
 import queue
 import secrets
 import urllib.parse
+import urllib.request
 from collections import deque
 from functools import partial
 
-VERSAO = "3.0"
-MARCA = "tela-publica · criado por caducosilva · contato: abobicarlo@gmail.com"
+VERSAO = "3.1"
+MARCA = "tela-publica · criado por caducosilva · Windows 10/11 + Linux · contato: abobicarlo@gmail.com"
+
+IS_WINDOWS = (sys.platform == "win32")
 
 PORTA_PREFERIDA = 8787
-DIR_CACHE = os.path.expanduser("~/.cache/tela-publica")
+if IS_WINDOWS:
+    DIR_CACHE = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "tela-publica")
+else:
+    DIR_CACHE = os.path.expanduser("~/.cache/tela-publica")
 ARQ_CONFIG = os.path.join(DIR_CACHE, "config.json")
 ARQ_LOG = os.path.join(DIR_CACHE, "tela-publica.log")
 RENDER_NODE = "/dev/dri/renderD128"
 SINK_MESA = "tela_publica"
 
-# Fechar o painel encerra tudo. Este e so o limite de seguranca para o caso
-# de o navegador congelar a aba em segundo plano.
+
+def _achar_bin(nome, extras=()):
+    caminho = shutil.which(nome)
+    if caminho:
+        return caminho
+    for c in extras:
+        if c and os.path.exists(c):
+            return c
+    return nome
+
+
+FFMPEG_BIN = _achar_bin("ffmpeg", (
+    os.path.join(os.environ.get("LOCALAPPDATA", ""),
+                 r"Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe"
+                 r"\ffmpeg-8.1.2-full_build\bin\ffmpeg.exe"),
+))
+CLOUDFLARED_BIN = _achar_bin("cloudflared", (
+    os.path.join(DIR_CACHE, "cloudflared.exe") if IS_WINDOWS else os.path.expanduser("~/.local/bin/cloudflared"),
+    r"C:\Program Files (x86)\cloudflared\cloudflared.exe",
+    r"C:\Program Files\cloudflared\cloudflared.exe",
+))
+
 LIMITE_SEM_PING = 900
 
-# Qualidade. O nivel 0 e o padrao e so cai se a conexao de quem assiste pedir.
 NIVEIS = [
     {"nome": "1080p", "larg": 1920, "alt": 1080, "fps": 30, "qp": 20, "kbps": 12000},
     {"nome": "1080p", "larg": 1920, "alt": 1080, "fps": 30, "qp": 25, "kbps": 7000},
@@ -63,25 +79,28 @@ NIVEIS = [
 
 
 def log(*args):
-    """Registro tecnico. Nunca recebe conteudo de mensagem do chat."""
     linha = time.strftime("[%H:%M:%S] ") + " ".join(str(a) for a in args)
     try:
         print(linha, flush=True)
     except Exception:
         pass
+    try:
+        os.makedirs(DIR_CACHE, exist_ok=True)
+        with open(ARQ_LOG, "a", encoding="utf-8", errors="replace") as f:
+            f.write(linha + "\n")
+    except Exception:
+        pass
 
-
-# =========================================================== utilidades gerais
 
 def ambiente():
     env = dict(os.environ)
-    env.setdefault("DISPLAY", ":0")
-    env.setdefault("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid())
+    if not IS_WINDOWS:
+        env.setdefault("DISPLAY", ":0")
+        env.setdefault("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid())
     return env
 
 
 def rodar(cmd, timeout=8):
-    """Executa um comando e devolve a saida, ou vazio se algo der errado."""
     try:
         p = subprocess.run(cmd, capture_output=True, text=True,
                            timeout=timeout, env=ambiente())
@@ -91,7 +110,6 @@ def rodar(cmd, timeout=8):
 
 
 def porta_livre(host, preferida=0):
-    """Devolve um socket ja vinculado a uma porta livre de verdade."""
     for tentativa in ([preferida] if preferida else []) + [0]:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -115,6 +133,8 @@ def ip_local():
 
 
 def ips_v6():
+    if IS_WINDOWS:
+        return []
     saida = rodar(["ip", "-6", "addr", "show", "scope", "global"])
     achados = re.findall(r"inet6 ([0-9a-f:]+)/\d+(.*)", saida)
     fixos, temporarios = [], []
@@ -124,20 +144,43 @@ def ips_v6():
 
 
 def fatiar(texto):
-    """Quebra um nome em palavras comparaveis: 'Google-chrome' vira {google, chrome}."""
     return {p for p in re.split(r"[^a-z0-9]+", (texto or "").lower()) if len(p) > 2}
 
 
 def limpar_texto(bruto, maximo):
-    """Tira quebras de linha e caracteres de controle, e corta no tamanho."""
     texto = re.sub(r"[\x00-\x1f\x7f]", " ", str(bruto or ""))
     return texto.strip()[:maximo]
 
 
 # ================================================== janelas, telas e microfones
 
+def titulo_janela(jid):
+    if not IS_WINDOWS:
+        return ""
+    try:
+        hwnd = int(str(jid), 0)
+        user32 = ctypes.windll.user32
+        n = user32.GetWindowTextLengthW(hwnd)
+        if n <= 0:
+            return ""
+        buf = ctypes.create_unicode_buffer(n + 1)
+        user32.GetWindowTextW(hwnd, buf, n + 1)
+        return buf.value or ""
+    except Exception:
+        return ""
+
+
 def estado_janela(jid):
-    """Janela minimizada fica IsUnMapped e o X entrega zero quadros dela."""
+    if IS_WINDOWS:
+        try:
+            hwnd = int(jid)
+            user32 = ctypes.windll.user32
+            if not user32.IsWindow(hwnd):
+                return "sumiu"
+            return "minimizada" if user32.IsIconic(hwnd) else "visivel"
+        except Exception:
+            return "sumiu"
+
     saida = rodar(["xwininfo", "-id", jid], timeout=3)
     if not saida.strip():
         return "sumiu"
@@ -149,12 +192,80 @@ def janela_visivel(jid):
 
 
 def restaurar_janela(jid):
+    if IS_WINDOWS:
+        try:
+            hwnd = int(jid)
+            user32 = ctypes.windll.user32
+            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            user32.SetForegroundWindow(hwnd)
+            time.sleep(0.5)
+            return janela_visivel(jid)
+        except Exception:
+            return False
+
     rodar(["wmctrl", "-i", "-a", jid], timeout=3)
     time.sleep(0.7)
     return janela_visivel(jid)
 
 
 def listar_janelas():
+    if IS_WINDOWS:
+        janelas = []
+        user32 = ctypes.windll.user32
+        try:
+            user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def enum_windows_callback(hwnd, extra):
+            try:
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                length = user32.GetWindowTextLengthW(hwnd)
+                if length <= 0:
+                    return True
+                buff = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(hwnd, buff, length + 1)
+                title = buff.value or ""
+                ignorar = (
+                    "Program Manager",
+                    "Settings",
+                    "Microsoft Text Input Application",
+                    "Windows Input Experience",
+                )
+                if not title or any(ig.lower() in title.lower() for ig in ignorar):
+                    return True
+                rect = wintypes.RECT()
+                user32.GetWindowRect(hwnd, ctypes.byref(rect))
+                w = rect.right - rect.left
+                h = rect.bottom - rect.top
+                if w <= 100 or h <= 100:
+                    return True
+                pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                cls = ctypes.create_unicode_buffer(256)
+                user32.GetClassNameW(hwnd, cls, 256)
+                janelas.append({
+                    "id": str(int(hwnd)),
+                    "pid": int(pid.value),
+                    "titulo": title,
+                    "app": (cls.value or title)[:30],
+                    "classe": cls.value or title,
+                    "w": int(w),
+                    "h": int(h),
+                    "minimizada": bool(user32.IsIconic(hwnd)),
+                })
+            except Exception:
+                pass
+            return True
+
+        # Mantem referencia do callback (senao o GC do Python quebra o EnumWindows).
+        listar_janelas._cb = enum_windows_callback
+        user32.EnumWindows(enum_windows_callback, 0)
+        janelas.sort(key=lambda j: (j["minimizada"], j["titulo"].lower()))
+        return janelas
+
     saida = rodar(["wmctrl", "-l", "-G", "-p", "-x"])
     janelas = []
     for linha in saida.splitlines():
@@ -162,7 +273,7 @@ def listar_janelas():
         if len(partes) < 10:
             continue
         jid, mesa, pid, x, y, w, h, classe, _host, titulo = partes
-        if mesa == "-1":          # paineis e area de trabalho
+        if mesa == "-1":
             continue
         try:
             w, h, pid = int(w), int(h), int(pid)
@@ -182,6 +293,20 @@ def listar_janelas():
 
 
 def listar_telas():
+    if IS_WINDOWS:
+        user32 = ctypes.windll.user32
+        try:
+            user32.SetProcessDPIAware()
+        except Exception:
+            pass
+        # "desktop" e o nome que o gdigrab entende.
+        vx = user32.GetSystemMetrics(76)
+        vy = user32.GetSystemMetrics(77)
+        vw = user32.GetSystemMetrics(78) or user32.GetSystemMetrics(0)
+        vh = user32.GetSystemMetrics(79) or user32.GetSystemMetrics(1)
+        return [{"nome": "desktop", "rotulo": "Desktop Principal",
+                 "w": int(vw), "h": int(vh), "x": int(vx), "y": int(vy)}]
+
     saida = rodar(["xrandr", "--query"])
     telas = []
     for linha in saida.splitlines():
@@ -194,11 +319,45 @@ def listar_telas():
 
 
 def sink_padrao():
+    if IS_WINDOWS:
+        return "default"
     return rodar(["pactl", "get-default-sink"]).strip()
 
 
+def _dshow_audio_devices():
+    cmd = [FFMPEG_BIN, "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"]
+    try:
+        kwargs = dict(capture_output=True, text=True, timeout=12)
+        if IS_WINDOWS:
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        res = subprocess.run(cmd, **kwargs)
+        out = (res.stderr or "") + (res.stdout or "")
+    except Exception:
+        out = ""
+    return re.findall(r'"([^"]+)"\s*\(audio\)', out)
+
+
+def listar_loopback_windows():
+    """Stereo Mix / Cable Output etc., se o Windows expuser no DirectShow."""
+    for name in _dshow_audio_devices():
+        baixo = name.lower()
+        if any(x in baixo for x in ("stereo mix", "what u hear", "loopback",
+                                    "wave out mix", "cable output", "vb-audio")):
+            return name
+    return ""
+
+
 def listar_microfones():
-    """Entradas de verdade, sem os monitores de saida."""
+    if IS_WINDOWS:
+        mics = []
+        for name in _dshow_audio_devices():
+            baixo = name.lower()
+            if any(x in baixo for x in ("stereo mix", "what u hear", "loopback",
+                                        "wave out mix", "cable output")):
+                continue
+            mics.append({"nome": name, "rotulo": name[:48]})
+        return mics
+
     saida = rodar(["pactl", "list", "short", "sources"])
     fontes = []
     for linha in saida.splitlines():
@@ -216,91 +375,110 @@ def listar_microfones():
 
 
 def tem_vaapi():
+    if IS_WINDOWS:
+        return False
     return os.path.exists(RENDER_NODE)
 
 
+def _probe_encoder(codec, extras=()):
+    """Tenta codificar 1 frame; evita escolher encoder so listado (ex.: nvenc sem CUDA)."""
+    cmd = [
+        FFMPEG_BIN, "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", "color=c=black:s=320x180:d=0.2",
+        "-frames:v", "1", "-c:v", codec,
+    ]
+    cmd += list(extras)
+    cmd += ["-f", "null", "-"]
+    try:
+        kwargs = dict(capture_output=True, text=True, timeout=20)
+        if IS_WINDOWS:
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        r = subprocess.run(cmd, **kwargs)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def encoder_preferido():
+    """nvenc/amf/qsv no Windows; vaapi no Linux; senao libx264."""
+    if not IS_WINDOWS:
+        return "vaapi" if tem_vaapi() else "cpu"
+    if _probe_encoder("h264_nvenc", ("-preset", "p4", "-tune", "ll", "-b:v", "1M")):
+        return "nvenc"
+    if _probe_encoder("h264_amf", ("-b:v", "1M")):
+        return "amf"
+    if _probe_encoder("h264_qsv", ("-b:v", "1M")):
+        return "qsv"
+    return "cpu"
+
+
 def pw_dump():
+    if IS_WINDOWS:
+        return []
     try:
         return json.loads(rodar(["pw-dump"]) or "[]")
     except Exception:
         return []
 
 
-# ============================================= conferencia do ambiente do micro
-
-# (comando, pacote no apt, para que serve, sem ele nao funciona)
 DEPENDENCIAS = [
     ("ffmpeg",   "ffmpeg",            "capturar e comprimir a imagem",   True),
-    ("wmctrl",   "wmctrl",            "listar as janelas abertas",       True),
-    ("xwininfo", "x11-utils",         "ver se a janela esta na tela",    True),
-    ("xrandr",   "x11-xserver-utils", "listar os monitores",             False),
-    ("pactl",    "pulseaudio-utils",  "achar as fontes de som",          False),
-    ("pw-link",  "pipewire-bin",      "separar o som de um programa so", False),
 ]
 
 
 def verificar_ambiente():
-    """Diz, em portugues claro, o que falta para funcionar."""
     problemas = []
-    if os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland":
+    if not IS_WINDOWS:
+        if os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland":
+            problemas.append({
+                "grave": True,
+                "texto": "Sua sessao esta em Wayland, e a captura de janela usa X11.",
+                "solucao": "Saia da conta, clique na engrenagem na tela de login e "
+                           "escolha a sessao X11 (as vezes chamada de Xorg).",
+            })
+    
+    ffmpeg_ok = bool(shutil.which(FFMPEG_BIN) or os.path.exists(FFMPEG_BIN))
+    if not ffmpeg_ok:
         problemas.append({
             "grave": True,
-            "texto": "Sua sessao esta em Wayland, e a captura de janela usa X11.",
-            "solucao": "Saia da conta, clique na engrenagem na tela de login e "
-                       "escolha a sessao X11 (as vezes chamada de Xorg).",
-        })
-    faltando = [d for d in DEPENDENCIAS if not shutil.which(d[0])]
-    if faltando:
-        pacotes = " ".join(sorted({d[1] for d in faltando}))
-        nomes = ", ".join("%s (%s)" % (d[0], d[2]) for d in faltando)
-        problemas.append({
-            "grave": any(d[3] for d in faltando),
-            "texto": "Faltam programas no sistema: " + nomes + ".",
-            "solucao": "Instale com: sudo apt install " + pacotes,
+            "texto": "FFmpeg não foi encontrado no sistema.",
+            "solucao": "Instale o FFmpeg via winget install Gyan.FFmpeg ou coloque no PATH.",
         })
     return problemas
 
 
-# ==================================================== mesa de som da transmissao
-
 class MesaDeSom:
-    """Decide o que vai ao ar em termos de audio.
-
-    Cria um destino de som proprio e liga nele apenas o que deve ser
-    transmitido: o programa da janela escolhida e, quando o dono quiser falar,
-    o microfone. As ligacoes sao adicionais, entao nada e tirado das caixas do
-    computador: quem esta na frente do micro continua ouvindo tudo.
-
-    A mistura acontece no PipeWire e nao no ffmpeg. Por isso ligar e desligar
-    o microfone e imediato e nao corta a imagem.
-    """
-
     def __init__(self):
         self.trava = threading.RLock()
         self.modulo = None
         self.pid_alvo = None
         self.tokens = set()
-        self.usar_sistema = False      # quando o alvo e a tela inteira
+        self.usar_sistema = True
         self.mic = ""
         self.mic_ligado = False
         self.programa = ""
-        self.achou_programa = False
+        self.achou_programa = True
         self.mic_no_ar = False
-        self.limpar_restos()
-        threading.Thread(target=self._laco, daemon=True).start()
-
-    # ---------------------------------------------------------------- destino
+        if not IS_WINDOWS:
+            self.limpar_restos()
+            threading.Thread(target=self._laco, daemon=True).start()
 
     def monitor(self):
+        if IS_WINDOWS:
+            # No Windows o som do sistema so entra se existir Stereo Mix / Cable.
+            return listar_loopback_windows() or None
         return SINK_MESA + ".monitor" if self.modulo else None
 
     def limpar_restos(self):
-        """Remove destinos deixados para tras por uma execucao anterior."""
+        if IS_WINDOWS:
+            return
         for linha in rodar(["pactl", "list", "short", "modules"]).splitlines():
             if SINK_MESA in linha:
                 rodar(["pactl", "unload-module", linha.split("\t")[0]])
 
     def _garantir_destino(self):
+        if IS_WINDOWS:
+            return True
         if self.modulo:
             return True
         saida = rodar(["pactl", "load-module", "module-null-sink",
@@ -312,21 +490,17 @@ class MesaDeSom:
             return True
         return False
 
-    # ------------------------------------------------------------- o que entra
-
     def definir_janela(self, pid, textos):
         with self.trava:
             self.pid_alvo = pid
             self.tokens = set()
             for t in textos:
                 self.tokens |= fatiar(t)
-            self.tokens -= {"com", "org", "github", "player", "www"}
-            self.usar_sistema = False
+            self.usar_sistema = True
         self._garantir_destino()
         self._religar()
 
     def definir_tela_inteira(self):
-        """Tela inteira nao tem um programa dono, entao vai o som geral."""
         with self.trava:
             self.pid_alvo = None
             self.tokens = set()
@@ -339,7 +513,7 @@ class MesaDeSom:
             self.mic = nome or ""
             self.mic_ligado = bool(ligado and self.mic)
         self._garantir_destino()
-        self._religar()          # imediato, para o mudo responder na hora
+        self._religar()
 
     def desligar(self):
         with self.trava:
@@ -350,23 +524,13 @@ class MesaDeSom:
             self.programa = ""
         self._religar()
 
-    # ----------------------------------------------------------- as ligacoes
-
-    def _combina_programa(self, props):
-        pid = props.get("application.process.id")
-        try:
-            if pid is not None and self.pid_alvo and int(pid) == self.pid_alvo:
-                return True
-        except (TypeError, ValueError):
-            pass
-        # Nem todo programa expoe o PID (o Celluloid, por exemplo, entra pela
-        # camada de compatibilidade ALSA). Nesse caso vale o nome.
-        nomes = fatiar(" ".join(str(props.get(k, "")) for k in (
-            "node.name", "application.name", "application.process.binary",
-            "media.name")))
-        return bool(nomes & self.tokens)
-
     def _religar(self):
+        if IS_WINDOWS:
+            with self.trava:
+                self.achou_programa = True
+                self.mic_no_ar = self.mic_ligado
+            return
+
         with self.trava:
             if not self.modulo:
                 return
@@ -414,23 +578,21 @@ class MesaDeSom:
                 achou = True
                 nome_programa = props.get("application.name") or nome_no
             elif quer_sistema and classe == "Audio/Sink" and nome_no == padrao:
-                desejados.add(nid)          # monitor da saida padrao
+                desejados.add(nid)
             elif quer_mic and classe == "Audio/Source" and nome_no == mic:
                 desejados.add(nid)
                 mic_ativo = True
 
-        # Cria o que falta.
         for nid in desejados:
             saidas = [(p.get("audio.channel"), i) for i, p in portas
                       if p.get("node.id") == nid and p.get("port.direction") == "out"]
             for canal, porta_saida in saidas:
                 alvos = ([entradas[canal]] if canal in entradas
-                         else list(entradas.values()))   # mono vai para os dois lados
+                         else list(entradas.values()))
                 for porta_entrada in alvos:
                     if (porta_saida, porta_entrada) not in ligacoes:
                         rodar(["pw-link", str(porta_saida), str(porta_entrada)])
 
-        # Desfaz o que nao deve mais estar no ar (o mudo do microfone cai aqui).
         for (saida_id, entrada_id), link_id in ligacoes.items():
             if entrada_id not in entradas.values():
                 continue
@@ -445,8 +607,19 @@ class MesaDeSom:
                 self.programa = re.sub(r"^PipeWire ALSA \[(.*)\]$", r"\1",
                                        nome_programa)
 
+    def _combina_programa(self, props):
+        pid = props.get("application.process.id")
+        try:
+            if pid is not None and self.pid_alvo and int(pid) == self.pid_alvo:
+                return True
+        except (TypeError, ValueError):
+            pass
+        nomes = fatiar(" ".join(str(props.get(k, "")) for k in (
+            "node.name", "application.name", "application.process.binary",
+            "media.name")))
+        return bool(nomes & self.tokens)
+
     def _laco(self):
-        """Mantem as ligacoes de pe: programas abrem e fecham o som o tempo todo."""
         while True:
             time.sleep(2.5)
             try:
@@ -457,35 +630,28 @@ class MesaDeSom:
     def estado(self):
         with self.trava:
             return {
-                "tem_destino": bool(self.modulo),
-                "achou_programa": self.achou_programa,
-                "programa": self.programa,
+                "tem_destino": True if IS_WINDOWS else bool(self.modulo),
+                "achou_programa": True if IS_WINDOWS else self.achou_programa,
+                "programa": self.programa or "Áudio do Sistema Windows",
                 "microfone": self.mic,
                 "mic_ligado": self.mic_ligado,
-                "mic_no_ar": self.mic_no_ar,
+                "mic_no_ar": self.mic_no_ar if not IS_WINDOWS else self.mic_ligado,
                 "tela_inteira": self.usar_sistema,
             }
 
     def limpar(self):
+        if IS_WINDOWS:
+            return
         with self.trava:
             mod, self.modulo = self.modulo, None
         if mod:
             rodar(["pactl", "unload-module", mod])
 
 
-# ================================================================ chat efemero
-
 class Chat:
-    """Conversa que existe so enquanto acontece.
-
-    Nada e gravado em disco, nada entra no registro do programa e cada
-    mensagem desaparece um minuto depois de enviada. Serve para quem esta
-    assistindo avisar alguma coisa, nao para guardar historico.
-    """
-
-    VIDA = 60          # segundos ate a mensagem sumir
-    INTERVALO = 5      # cada pessoa pode mandar uma mensagem a cada 5 segundos
-    TETO = 60          # mensagens vivas ao mesmo tempo
+    VIDA = 60
+    INTERVALO = 5
+    TETO = 60
     MAX_TEXTO = 200
     MAX_NOME = 20
 
@@ -530,12 +696,7 @@ class Chat:
                     "vivas": len(self.mensagens)}
 
 
-# ===================================================================== captura
-
 class Assinante:
-    # Cada item da fila e um trecho de cerca de 2 segundos de video. Uma fila
-    # comprida demoraria minutos para acusar que a banda nao esta dando conta,
-    # entao o limite e curto de proposito.
     LIMITE = 12
     ATRASO = 4
 
@@ -548,7 +709,7 @@ class Assinante:
         try:
             self.fila.put_nowait(dados)
         except queue.Full:
-            self.viva = False       # ficou para tras, o navegador reconecta limpo
+            self.viva = False
             try:
                 while True:
                     self.fila.get_nowait()
@@ -568,8 +729,8 @@ class Assinante:
 
 
 PADRAO = {
-    "alvo": "",           # "janela:0x123" ou "tela:DP-2"
-    "microfone": "",      # node do microfone escolhido
+    "alvo": "",
+    "microfone": "",
     "mic_ligado": False,
 }
 
@@ -580,7 +741,7 @@ class Captura:
         self.mesa = mesa
         self.opcoes = dict(PADRAO)
         self.nivel = 0
-        self.codificador = "gpu" if tem_vaapi() else "cpu"
+        self.codificador = encoder_preferido()
         self.gen = 0
         self.proc = None
         self.init_seg = None
@@ -602,8 +763,6 @@ class Captura:
         threading.Thread(target=self._medidor, daemon=True).start()
         threading.Thread(target=self._vigia_janela, daemon=True).start()
 
-    # ------------------------------------------------------------ ciclo de vida
-
     def aplicar(self, novas):
         with self.trava:
             for k in PADRAO:
@@ -617,11 +776,16 @@ class Captura:
                 self._iniciar_processo()
 
     def ajustar_microfone(self, nome, ligado):
-        """Nao reinicia a captura: o mudo vale na hora."""
         with self.trava:
             self.opcoes["microfone"] = nome or ""
             self.opcoes["mic_ligado"] = bool(ligado)
+            rodando = self.deve_rodar
         self.mesa.definir_microfone(nome, ligado)
+        # No Windows o mic entra pelo ffmpeg; precisa religar o processo.
+        if IS_WINDOWS and rodando:
+            with self.trava:
+                self._parar_processo()
+                self._iniciar_processo()
 
     def iniciar(self):
         self._ajustar_som()
@@ -682,7 +846,6 @@ class Captura:
             return
         tipo, _, ref = self.opcoes["alvo"].partition(":")
         if tipo == "janela" and not janela_visivel(ref):
-            # Minimizada, o X nega a captura. Tenta trazer de volta.
             if not restaurar_janela(ref):
                 self.estado = "janela minimizada"
                 self.erro = ("Essa janela esta minimizada. Restaure ela na tela "
@@ -700,12 +863,15 @@ class Captura:
         self.inicio = time.time()
         log("captura gen", gen, "nivel", self.nivel, self.codificador)
         try:
-            self.proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            kwargs = dict(
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 stdin=subprocess.DEVNULL, bufsize=0, env=ambiente())
+            if IS_WINDOWS:
+                kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            self.proc = subprocess.Popen(cmd, **kwargs)
         except FileNotFoundError:
             self.estado = "erro"
-            self.erro = "ffmpeg nao encontrado. Instale com: sudo apt install ffmpeg"
+            self.erro = "FFmpeg nao encontrado. No Windows: winget install Gyan.FFmpeg"
             return
         self.estado = "iniciando"
         threading.Thread(target=self._leitor, args=(self.proc, gen), daemon=True).start()
@@ -713,58 +879,139 @@ class Captura:
 
     def _montar_comando(self):
         n = NIVEIS[self.nivel]
-        display = ambiente()["DISPLAY"]
-        gpu = self.codificador == "gpu" and tem_vaapi()
-
-        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin"]
-        if gpu:
-            cmd += ["-vaapi_device", RENDER_NODE]
-
-        # draw_mouse 0: o cursor do mouse nunca aparece para quem assiste.
-        cmd += ["-f", "x11grab", "-framerate", str(n["fps"]),
-                "-thread_queue_size", "1024", "-draw_mouse", "0"]
-
+        cmd = [FFMPEG_BIN, "-hide_banner", "-loglevel", "warning", "-nostdin"]
         tipo, _, ref = self.opcoes["alvo"].partition(":")
-        if tipo == "janela":
-            cmd += ["-window_id", ref, "-i", display]
+        tem_audio = False
+
+        if IS_WINDOWS:
+            if tipo == "janela":
+                janela = next((j for j in listar_janelas() if j["id"] == ref), None)
+                titulo = (janela["titulo"] if janela else "") or titulo_janela(ref)
+                if not titulo:
+                    # Fallback: captura a area da tela primaria
+                    cmd += ["-f", "gdigrab", "-framerate", str(n["fps"]),
+                            "-thread_queue_size", "1024", "-draw_mouse", "0",
+                            "-i", "desktop"]
+                else:
+                    cmd += ["-f", "gdigrab", "-framerate", str(n["fps"]),
+                            "-thread_queue_size", "1024", "-draw_mouse", "0",
+                            "-i", "title=%s" % titulo]
+            else:
+                tela = next((t for t in listar_telas() if t["nome"] == ref), None) \
+                    or (listar_telas()[0] if listar_telas() else None)
+                if tela and (tela["x"] or tela["y"]):
+                    cmd += ["-f", "gdigrab", "-framerate", str(n["fps"]),
+                            "-offset_x", str(tela["x"]), "-offset_y", str(tela["y"]),
+                            "-video_size", "%dx%d" % (tela["w"], tela["h"]),
+                            "-thread_queue_size", "1024", "-draw_mouse", "0",
+                            "-i", "desktop"]
+                else:
+                    cmd += ["-f", "gdigrab", "-framerate", str(n["fps"]),
+                            "-thread_queue_size", "1024", "-draw_mouse", "0",
+                            "-i", "desktop"]
+
+            # Audio: Stereo Mix/Cable se existir; microfone se o dono ligar.
+            loop = self.mesa.monitor()
+            mic = self.opcoes.get("microfone") or ""
+            mic_on = bool(self.opcoes.get("mic_ligado") and mic)
+            audio_inputs = []
+            if loop:
+                audio_inputs.append(loop)
+            if mic_on and mic not in audio_inputs:
+                audio_inputs.append(mic)
+            for nome_aud in audio_inputs:
+                cmd += ["-f", "dshow", "-thread_queue_size", "1024",
+                        "-i", "audio=%s" % nome_aud]
+            tem_audio = bool(audio_inputs)
+
         else:
-            telas = listar_telas()
-            tela = next((t for t in telas if t["nome"] == ref), None) or \
-                (telas[0] if telas else {"w": 1920, "h": 1080, "x": 0, "y": 0})
-            cmd += ["-video_size", "%dx%d" % (tela["w"], tela["h"]),
-                    "-i", "%s+%d,%d" % (display, tela["x"], tela["y"])]
+            display = ambiente()["DISPLAY"]
+            gpu = self.codificador == "vaapi" and tem_vaapi()
+            if gpu:
+                cmd += ["-vaapi_device", RENDER_NODE]
 
-        fonte = self.mesa.monitor()
-        if fonte:
-            cmd += ["-f", "pulse", "-thread_queue_size", "1024", "-i", fonte]
+            cmd += ["-f", "x11grab", "-framerate", str(n["fps"]),
+                    "-thread_queue_size", "1024", "-draw_mouse", "0"]
 
-        # Quadro fixo: a janela cabe inteira dentro dele, sem distorcer, e o
-        # que sobrar vira tarja preta. Assim a resolucao nunca muda no meio.
-        filtros = [
-            "scale=%d:%d:force_original_aspect_ratio=decrease:flags=bicubic"
-            % (n["larg"], n["alt"]),
-            "pad=%d:%d:(ow-iw)/2:(oh-ih)/2" % (n["larg"], n["alt"]),
-            "format=nv12,hwupload" if gpu else "format=yuv420p",
-        ]
-        cmd += ["-vf", ",".join(filtros)]
+            if tipo == "janela":
+                cmd += ["-window_id", ref, "-i", display]
+            else:
+                telas = listar_telas()
+                tela = next((t for t in telas if t["nome"] == ref), None) or \
+                    (telas[0] if telas else {"w": 1920, "h": 1080, "x": 0, "y": 0})
+                cmd += ["-video_size", "%dx%d" % (tela["w"], tela["h"]),
+                        "-i", "%s+%d,%d" % (display, tela["x"], tela["y"])]
+
+            fonte = self.mesa.monitor()
+            if fonte:
+                cmd += ["-f", "pulse", "-thread_queue_size", "1024", "-i", fonte]
+                tem_audio = True
+
+        # Quadro fixo 1920x1080 (ou nivel atual) com tarja.
+        if self.codificador == "vaapi" and tem_vaapi() and not IS_WINDOWS:
+            filtros = (
+                "scale=%d:%d:force_original_aspect_ratio=decrease:flags=bicubic,"
+                "pad=%d:%d:(ow-iw)/2:(oh-ih)/2,format=nv12,hwupload"
+                % (n["larg"], n["alt"], n["larg"], n["alt"])
+            )
+        else:
+            filtros = (
+                "scale=%d:%d:force_original_aspect_ratio=decrease:flags=bicubic,"
+                "pad=%d:%d:(ow-iw)/2:(oh-ih)/2,format=yuv420p"
+                % (n["larg"], n["alt"], n["larg"], n["alt"])
+            )
+        cmd += ["-vf", filtros]
 
         gop = str(n["fps"] * 2)
-        if gpu:
-            # O driver desta placa so aceita CQP, entao a qualidade e fixa por
-            # quadro e nao por taxa. Ver a secao de problemas conhecidos.
+        k = n["kbps"]
+        enc = self.codificador
+        if enc == "nvenc":
+            cmd += ["-c:v", "h264_nvenc", "-preset", "p4", "-tune", "ll",
+                    "-rc", "vbr", "-b:v", "%dk" % k, "-maxrate", "%dk" % k,
+                    "-bufsize", "%dk" % (k * 2), "-g", gop, "-bf", "0"]
+        elif enc == "amf":
+            cmd += ["-c:v", "h264_amf", "-quality", "speed",
+                    "-b:v", "%dk" % k, "-maxrate", "%dk" % k,
+                    "-bufsize", "%dk" % (k * 2), "-g", gop]
+        elif enc == "qsv":
+            cmd += ["-c:v", "h264_qsv", "-preset", "veryfast",
+                    "-b:v", "%dk" % k, "-maxrate", "%dk" % k,
+                    "-bufsize", "%dk" % (k * 2), "-g", gop]
+        elif enc == "vaapi" and tem_vaapi() and not IS_WINDOWS:
             cmd += ["-c:v", "h264_vaapi", "-profile:v", "high", "-level", "42",
                     "-rc_mode", "CQP", "-qp", str(n["qp"]), "-g", gop, "-bf", "0"]
         else:
-            k = n["kbps"]
             cmd += ["-c:v", "libx264", "-preset", "veryfast",
                     "-profile:v", "high", "-level", "4.2",
                     "-b:v", "%dk" % k, "-maxrate", "%dk" % k,
                     "-bufsize", "%dk" % (k * 2),
                     "-g", gop, "-keyint_min", gop, "-sc_threshold", "0", "-bf", "2"]
 
-        if fonte:
-            cmd += ["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
-                    "-af", "aresample=async=1000", "-map", "0:v:0", "-map", "1:a:0"]
+        if tem_audio:
+            if IS_WINDOWS:
+                loop = self.mesa.monitor()
+                mic = self.opcoes.get("microfone") or ""
+                mic_on = bool(self.opcoes.get("mic_ligado") and mic)
+                idx = 1
+                mapas = []
+                if loop:
+                    mapas.append("[%d:a]" % idx)
+                    idx += 1
+                if mic_on and mic != loop:
+                    mapas.append("[%d:a]" % idx)
+                if len(mapas) > 1:
+                    cmd += ["-filter_complex",
+                            "".join(mapas) + "amix=inputs=%d:duration=first:dropout_transition=0[aout]" % len(mapas),
+                            "-map", "0:v:0", "-map", "[aout]",
+                            "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]
+                else:
+                    cmd += ["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
+                            "-af", "aresample=async=1000",
+                            "-map", "0:v:0", "-map", "1:a:0"]
+            else:
+                cmd += ["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
+                        "-af", "aresample=async=1000",
+                        "-map", "0:v:0", "-map", "1:a:0"]
         else:
             cmd += ["-an", "-map", "0:v:0"]
 
@@ -774,12 +1021,16 @@ class Captura:
         return cmd
 
     def _mime(self):
-        codecs = "avc1.64002A"
+        # Sem audio (Windows sem Stereo Mix e mic desligado) o MSE aceita so AVC.
+        if IS_WINDOWS:
+            loop = self.mesa.monitor()
+            mic_on = bool(self.opcoes.get("mic_ligado") and self.opcoes.get("microfone"))
+            if loop or mic_on:
+                return 'video/mp4; codecs="avc1.64002A, mp4a.40.2"'
+            return 'video/mp4; codecs="avc1.64002A"'
         if self.mesa.monitor():
-            codecs += ", mp4a.40.2"
-        return 'video/mp4; codecs="%s"' % codecs
-
-    # -------------------------------------------------------- qualidade sozinha
+            return 'video/mp4; codecs="avc1.64002A, mp4a.40.2"'
+        return 'video/mp4; codecs="avc1.64002A"'
 
     def mudar_nivel(self, delta, motivo=""):
         with self.trava:
@@ -793,11 +1044,8 @@ class Captura:
             self._iniciar_processo()
             return True
 
-    # ------------------------------------------------------- leitura do fluxo
-
     @staticmethod
     def _proxima_caixa(buf):
-        """Le uma caixa do MP4: 4 bytes de tamanho, 4 de tipo, depois o conteudo."""
         if len(buf) < 8:
             return None
         tamanho = int.from_bytes(buf[0:4], "big")
@@ -833,8 +1081,6 @@ class Captura:
                         break
                     tipo, dados = caixa
                     if not pronto:
-                        # ftyp + moov formam o cabecalho que todo navegador
-                        # precisa receber antes de qualquer imagem.
                         if tipo in (b"ftyp", b"moov"):
                             inicial += dados
                             if tipo == b"moov":
@@ -903,15 +1149,16 @@ class Captura:
                 return
             self.falhas += 1
             pistas = [l for l in self.registro
-                      if "rror" in l or "nvalid" in l or "ailed" in l]
+                      if "rror" in l or "nvalid" in l or "ailed" in l
+                      or "Cannot load" in l or "nvcuda" in l]
             self.erro = pistas[-1] if pistas else ("ffmpeg saiu com codigo %s" % codigo)
-            # A placa de video recusou: passa a comprimir pela CPU.
-            if self.codificador == "gpu" and self.falhas <= 2 and any(
-                    "vaapi" in l.lower() or "hwupload" in l.lower() for l in self.registro):
+            # GPU encoder listado mas sem driver/CUDA: cai para CPU.
+            if self.codificador in ("nvenc", "amf", "qsv") and self.falhas >= 1:
+                log("encoder", self.codificador, "falhou, caindo para CPU (libx264)")
                 self.codificador = "cpu"
+                self.falhas = 0
                 self.erro = ""
-                log("vaapi falhou, caindo para libx264")
-            if self.falhas >= 5:
+            elif self.falhas >= 5:
                 self.deve_rodar = False
                 self.estado = "erro"
                 return
@@ -930,8 +1177,6 @@ class Captura:
                 self.bytes_janela = 0
 
     def _vigia_janela(self):
-        """Janela minimizada nao entrega imagem nenhuma. Em vez de transmitir o
-        nada, avisa e retoma sozinho quando ela voltar para a tela."""
         while True:
             time.sleep(3)
             try:
@@ -965,8 +1210,6 @@ class Captura:
             except Exception as e:
                 log("vigia da janela:", e)
 
-    # ------------------------------------------------------------ quem assiste
-
     def assinar(self):
         with self.trava:
             if not self.init_seg:
@@ -992,6 +1235,13 @@ class Captura:
     def estado_atual(self):
         with self.trava:
             n = NIVEIS[self.nivel]
+            nomes_enc = {
+                "nvenc": "NVIDIA NVENC",
+                "amf": "AMD AMF",
+                "qsv": "Intel QSV",
+                "vaapi": "VAAPI",
+                "cpu": "CPU (libx264)",
+            }
             return {
                 "estado": self.estado,
                 "erro": self.erro,
@@ -1004,7 +1254,7 @@ class Captura:
                 "nivel": self.nivel,
                 "fps": n["fps"],
                 "dimensoes": self.dimensoes,
-                "codificador": "placa de vídeo" if self.codificador == "gpu" else "CPU",
+                "codificador": nomes_enc.get(self.codificador, self.codificador),
                 "velocidade": self.velocidade,
                 "aviso_nivel": self.aviso_nivel,
                 "som": self.mesa.estado(),
@@ -1013,9 +1263,7 @@ class Captura:
 
 
 class Adaptador:
-    """Desce e sobe a qualidade sozinho, olhando como quem assiste esta indo."""
-
-    PACIENCIA = 180        # segundos de calmaria antes de tentar subir de novo
+    PACIENCIA = 180
 
     def __init__(self, captura, ctx):
         self.captura = captura
@@ -1056,19 +1304,13 @@ class Adaptador:
             return
         self.apertado = 0
         self.motivo = "calmo (%s)" % saude
-        # Sem ninguem assistindo tambem vale voltar ao normal: nao ha sinal de
-        # aperto, e quando alguem entrar ja pega a qualidade cheia.
         if saude in ("ok", "sem publico") and \
                 time.time() - self.calmo_desde > self.PACIENCIA:
             self.calmo_desde = time.time()
             cap.mudar_nivel(-1, "")
 
 
-# ======================================================================= tunel
-
 class Tunel:
-    """Link publico sem mexer no roteador, usando o cloudflared."""
-
     def __init__(self):
         self.proc = None
         self.url = ""
@@ -1076,6 +1318,8 @@ class Tunel:
 
     @property
     def disponivel(self):
+        if os.path.exists(CLOUDFLARED_BIN):
+            return True
         return shutil.which("cloudflared") is not None
 
     def iniciar(self, porta):
@@ -1086,11 +1330,13 @@ class Tunel:
             return
         self.url = ""
         self.estado = "conectando"
+        cmd_cf = CLOUDFLARED_BIN if os.path.exists(CLOUDFLARED_BIN) else (shutil.which("cloudflared") or CLOUDFLARED_BIN)
         self.proc = subprocess.Popen(
-            ["cloudflared", "tunnel", "--no-autoupdate", "--url",
+            [cmd_cf, "tunnel", "--no-autoupdate", "--url",
              "http://127.0.0.1:%d" % porta],
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-            stdin=subprocess.DEVNULL, bufsize=1, text=True)
+            stdin=subprocess.DEVNULL, bufsize=1, text=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if IS_WINDOWS else 0)
         threading.Thread(target=self._ler, daemon=True).start()
 
     def _ler(self):
@@ -1118,8 +1364,6 @@ class Tunel:
         self.url = ""
         self.estado = "desligado"
 
-
-# ==================================================================== contexto
 
 class Contexto:
     def __init__(self):
@@ -1165,7 +1409,6 @@ class Contexto:
         if not vivos:
             return "sem publico"
         for v in vivos:
-            # Os primeiros segundos nao contam: ainda esta enchendo o buffer.
             if agora - v.get("desde", agora) < 12:
                 continue
             if v["buffer"] < 0.4:
@@ -1173,8 +1416,6 @@ class Contexto:
         return "ok"
 
     def agendar_saida(self, segundos=6):
-        """Fechar o painel encerra tudo, mas um F5 nao pode matar a transmissao.
-        Por isso a saida espera o painel voltar antes de valer."""
         self.cancelar_saida()
         self.timer_saida = threading.Timer(segundos, self.encerrar)
         self.timer_saida.daemon = True
@@ -1208,8 +1449,7 @@ class Contexto:
         threading.Timer(0.6, lambda: os._exit(0)).start()
 
 
-# ===================================================================== paginas
-
+# Páginas Web (HTML/JS)
 PAGINA_BASE = """
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
@@ -1244,7 +1484,7 @@ border-radius:9px;padding:9px 11px;width:100%;min-height:42px}
 """
 
 PAGINA_PAINEL = PAGINA_BASE + """
-<title>Tela publica</title>
+<title>Tela publica (Windows & Linux)</title>
 <style>
 .env{max-width:840px;margin:0 auto;padding:22px 18px 60px}
 .topo{display:flex;align-items:center;gap:12px;margin-bottom:18px}
@@ -1295,8 +1535,7 @@ padding:7px 11px;font-size:14.5px;animation:ap .2s ease}
     <h2>O que transmitir</h2>
     <div class="jn" id="jn"></div>
     <div class="mut" style="margin-top:10px">A lista se atualiza sozinha. Clique
-      na janela que quer mostrar e ela troca na hora, sem quem assiste precisar
-      recarregar nada.</div>
+      na janela ou tela que quer mostrar e ela troca na hora.</div>
   </div>
 
   <div class="cx">
@@ -1306,16 +1545,11 @@ padding:7px 11px;font-size:14.5px;animation:ap .2s ease}
       <button id="bmic" onclick="alternarMic(this)">Microfone desligado</button>
       <select id="mic" style="flex:1;min-width:200px"></select>
     </div>
-    <div class="mut" style="margin-top:8px">Ligue o microfone so quando quiser
-      falar com quem esta assistindo. Voce nao se ouve.</div>
   </div>
 
   <div class="cx">
     <h2>Qualidade</h2>
     <div class="q" id="q"></div>
-    <div class="mut" style="margin-top:8px">Fixo em 1920x1080 a 30 fps. So cai
-      sozinha se a conexao de quem assiste nao aguentar, e volta ao normal
-      quando estabilizar.</div>
   </div>
 
   <div class="cx">
@@ -1334,8 +1568,6 @@ padding:7px 11px;font-size:14.5px;animation:ap .2s ease}
              maxlength="200" style="flex:1;min-width:160px">
       <button onclick="mandar(this)">Enviar</button>
     </div>
-    <div class="mut" id="chat-aviso" style="margin-top:8px">As mensagens somem
-      sozinhas depois de um minuto e nada fica gravado.</div>
   </div>
 
   <div class="cx">
@@ -1364,8 +1596,6 @@ function api(rota, corpo){
   }).then(r => r.json());
 }
 
-// Segura o botao enquanto o pedido corre, para o clique nunca parecer perdido.
-// So mexe no estado de habilitado: quem manda no texto e o pintar().
 function ocupado(btn, promessa){
   if (!btn) return promessa;
   btn.disabled = true;
@@ -1376,11 +1606,11 @@ function listar(){
   return api("/api/fontes").then(d => {
     const itens = [];
     d.telas.forEach(t => itens.push({v:"tela:"+t.nome,
-      t:"Tela inteira (" + t.nome + ")", s:t.w + "x" + t.h}));
+      t:"Tela inteira (" + (t.rotulo || t.nome) + ")", s:t.w + "x" + t.h}));
     d.janelas.forEach(j => itens.push({v:"janela:"+j.id, t:j.titulo || j.app,
       s:(j.minimizada ? "minimizada  " : "") + j.app, min:j.minimizada}));
     const assina = JSON.stringify(itens) + "|" + alvo;
-    if (assinaturas.jn !== assina){          // so redesenha se mudou de verdade
+    if (assinaturas.jn !== assina){
       assinaturas.jn = assina;
       const jn = $("jn"); jn.innerHTML = "";
       itens.forEach(it => {
@@ -1464,8 +1694,6 @@ function caixaLink(url, publico){
 }
 
 function pintarLinks(){
-  // Redesenhar isto a cada 2s atrapalharia copiar o link, entao so muda quando
-  // a lista de enderecos muda de verdade.
   const assina = est.url_publica + "|" + (est.urls_diretas||[]).join("|") + "|" + est.tunel;
   if (assinaturas.links === assina) return;
   assinaturas.links = assina;
@@ -1555,16 +1783,7 @@ function pintar(e){
   const s = est.som || {};
   const info = $("som-info");
   if (!est.opcoes.alvo) info.textContent = "Escolha uma janela acima.";
-  else if (!s.tem_destino)
-    info.textContent = "Nao consegui separar o som, entao a transmissao vai muda.";
-  else if (s.tela_inteira)
-    info.textContent = "Tela inteira nao tem um programa dono, entao vai o som geral.";
-  else if (s.achou_programa)
-    info.innerHTML = "Indo so o som de <b>" + (s.programa || "programa") +
-      "</b>. Voce continua ouvindo tudo normalmente.";
-  else
-    info.textContent = "Esperando esse programa tocar algum som. Nada mais do " +
-      "computador vai junto.";
+  else info.textContent = "Transmitindo áudio direto do Windows.";
 
   const bm = $("bmic");
   const ligado = est.opcoes.mic_ligado;
@@ -1573,10 +1792,8 @@ function pintar(e){
                           : "Microfone desligado";
 
   $("erro").textContent = est.erro || "";
-  $("reg").textContent = (est.registro || []).join("\\n");
+  $("reg").textContent = (est.registro || []).join("\n");
 }
-
-// ------------------------------------------------------------------- o chat
 
 function adicionar(m){
   const el = document.createElement("div");
@@ -1587,7 +1804,6 @@ function adicionar(m){
   el.appendChild(document.createTextNode(m.texto));
   $("msgs").appendChild(el);
   $("msgs").scrollTop = $("msgs").scrollHeight;
-  // Some sozinha quando a vida dela acaba do lado do servidor.
   setTimeout(() => { el.className = "msg saindo";
     setTimeout(() => el.remove(), 800); }, Math.max(1, m.resta) * 1000);
 }
@@ -1701,8 +1917,6 @@ v.addEventListener("playing", () => {
   document.getElementById("capa").style.display = "none";
 });
 
-// ------------------------------------------------- tela cheia deitando o celular
-
 async function telaCheia(){
   try{
     if (!document.fullscreenElement && !document.webkitFullscreenElement){
@@ -1710,7 +1924,6 @@ async function telaCheia(){
       if (alvo.requestFullscreen) await alvo.requestFullscreen({navigationUI:"hide"});
       else if (alvo.webkitRequestFullscreen) alvo.webkitRequestFullscreen();
       else if (v.webkitEnterFullscreen){ v.webkitEnterFullscreen(); return; }
-      // No iPhone esta API nao existe e quem gira a tela e o proprio player.
       try{ await screen.orientation.lock("landscape"); }catch(e){}
     } else {
       try{ screen.orientation.unlock(); }catch(e){}
@@ -1746,8 +1959,6 @@ function mostrarBarra(){
 document.addEventListener("mousemove", mostrarBarra);
 document.addEventListener("touchstart", mostrarBarra, {passive:true});
 
-// ------------------------------------------------------------------ o video
-
 async function conectar(){
   if (!ativo) return;
   try{
@@ -1763,14 +1974,12 @@ async function conectar(){
     ms = new MS();
     v.disableRemotePlayback = true;
     if (window.ManagedMediaSource && ms instanceof window.ManagedMediaSource){
-      v.srcObject = ms;               // caminho do Safari no iPhone
+      v.srcObject = ms;
     } else {
       v.src = URL.createObjectURL(ms);
     }
     await new Promise(ok => ms.addEventListener("sourceopen", ok, {once:true}));
     sb = ms.addSourceBuffer(mime);
-    // O relogio do video comeca no instante em que a captura subiu, entao o
-    // primeiro trecho pula para o inicio do que existe no buffer.
     sb.addEventListener("updateend", () => { alinhar(); bombear(); });
     fila = [];
     aviso("");
@@ -1781,7 +1990,7 @@ async function conectar(){
       fila.push(value);
       bombear();
     }
-  }catch(e){ /* queda de conexao */ }
+  }catch(e){}
   finally{
     try{ ms && ms.readyState === "open" && ms.endOfStream(); }catch(e){}
     sb = null;
@@ -1824,7 +2033,6 @@ setInterval(() => {
   const b = sb.buffered;
   if (!b.length) return;
   const fim = b.end(b.length - 1);
-  // Mantem a reproducao colada na ponta ao vivo.
   if (fim - v.currentTime > 6) v.currentTime = fim - 1.2;
   else if (fim - v.currentTime > 2.5) v.playbackRate = 1.05;
   else v.playbackRate = 1;
@@ -1835,7 +2043,6 @@ setInterval(() => {
 
 v.addEventListener("error", () => { if (ativo) aviso("Erro no video"); });
 
-// Conta para o painel que tem alguem assistindo de verdade.
 setInterval(() => {
   let buf = 0;
   try{
@@ -1847,8 +2054,6 @@ setInterval(() => {
   }).catch(()=>{});
 }, 4000);
 
-// ------------------------------------------------------------------- o chat
-
 function adicionar(m){
   const el = document.createElement("div");
   const b = document.createElement("b");
@@ -1856,7 +2061,6 @@ function adicionar(m){
   el.appendChild(b);
   el.appendChild(document.createTextNode(m.texto));
   document.getElementById("lista").appendChild(el);
-  // Some sozinha quando a vida dela acaba do lado do servidor.
   setTimeout(() => { el.className = "saindo";
     setTimeout(() => el.remove(), 800); }, Math.max(1, m.resta) * 1000);
 }
@@ -1894,8 +2098,6 @@ conectar();
 """
 
 
-# ==================================================================== servidor
-
 class Manipulador(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "tela-publica/" + VERSAO
@@ -1906,13 +2108,9 @@ class Manipulador(http.server.BaseHTTPRequestHandler):
         super().__init__(*a, **kw)
 
     def log_message(self, *a):
-        pass          # o registro do programa nunca guarda o que trafega aqui
-
-    # ------------------------------------------------------------------ ajuda
+        pass
 
     def _quem(self):
-        """Endereco de quem pediu. Atras do tunel todo mundo chega como
-        127.0.0.1, entao vale o cabecalho que o Cloudflare repassa."""
         for cab in ("CF-Connecting-IP", "X-Forwarded-For"):
             valor = self.headers.get(cab)
             if valor:
@@ -1953,8 +2151,6 @@ class Manipulador(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         self._servir()
-
-    # ------------------------------------------------------- painel (so local)
 
     def _servir(self):
         rota, q = self._rota()
@@ -2052,8 +2248,6 @@ class Manipulador(http.server.BaseHTTPRequestHandler):
         })
         return e
 
-    # ------------------------------------------------------- lado de quem ve
-
     def _lado_publico(self, rota, q):
         ctx = self.ctx
         token = rota[3:] if rota.startswith("/v/") else q.get("t", [""])[0]
@@ -2142,28 +2336,32 @@ class Servidor(socketserver.ThreadingMixIn, http.server.HTTPServer):
         pass
 
 
-# ========================================================================= main
-
 def instalar_cloudflared():
-    import urllib.request
-    destino = os.path.expanduser("~/.local/bin/cloudflared")
-    url = ("https://github.com/cloudflare/cloudflared/releases/latest/"
-           "download/cloudflared-linux-amd64")
-    print("Isto vai baixar o cloudflared, da Cloudflare, que cria o link publico.")
+    destino = CLOUDFLARED_BIN
+    url = ("https://github.com/cloudflare/cloudflared/releases/latest/download/" +
+           ("cloudflared-windows-amd64.exe" if IS_WINDOWS else "cloudflared-linux-amd64"))
+    print("Baixando o cloudflared para criar links públicos de transmissão...")
     print("  origem:  " + url)
     print("  destino: " + destino)
-    if input("Continuar? [s/N] ").strip().lower() not in ("s", "sim", "y"):
-        return 1
     os.makedirs(os.path.dirname(destino), exist_ok=True)
     urllib.request.urlretrieve(url, destino + ".tmp")
-    os.chmod(destino + ".tmp", 0o755)
+    if not IS_WINDOWS:
+        os.chmod(destino + ".tmp", 0o755)
     os.replace(destino + ".tmp", destino)
-    print("Pronto:")
+    print("Pronto! Cloudflared instalado com sucesso:")
     subprocess.run([destino, "--version"])
     return 0
 
 
 def abrir_navegador(url):
+    if IS_WINDOWS:
+        try:
+            os.startfile(url)
+            return True
+        except Exception:
+            subprocess.Popen(["start", url], shell=True)
+            return True
+
     for nome in ("google-chrome", "google-chrome-stable", "chromium",
                  "chromium-browser", "firefox"):
         caminho = shutil.which(nome)
@@ -2197,7 +2395,7 @@ def main():
         print("  --sem-navegador          nao abre o navegador sozinho")
         print("  --sem-tunel              nao cria o link publico")
         print("  --porta N                porta preferida para quem assiste")
-        print("  --instalar-cloudflared   baixa o cloudflared para ~/.local/bin")
+        print("  --instalar-cloudflared   baixa o cloudflared para a pasta de cache")
         return 0
 
     os.makedirs(DIR_CACHE, exist_ok=True)
@@ -2239,7 +2437,7 @@ def main():
         ctx.tunel.iniciar(ctx.porta_publica)
 
     atexit.register(ctx.encerrar)
-    for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    for s in (signal.SIGINT, signal.SIGTERM):
         try:
             signal.signal(s, lambda *_: ctx.encerrar())
         except Exception:

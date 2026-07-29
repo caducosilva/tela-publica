@@ -42,6 +42,29 @@ computador. Nada para instalar, nada para configurar, nada gravado.
 
 ## Começo rápido
 
+### Windows 10/11
+
+Requisitos: Python 3.8+ e FFmpeg no PATH (`winget install Gyan.FFmpeg`).
+O cloudflared já pode estar instalado; se não, rode com `--instalar-cloudflared`.
+
+```powershell
+cd $env:USERPROFILE\tela-publica
+.\tela-publica.bat
+```
+
+Ou direto:
+
+```powershell
+python .\tela-publica
+```
+
+No Windows a captura usa **gdigrab** (tela/janela) e áudio via **DirectShow**.
+Som do sistema só entra se existir *Stereo Mix* / *Cable Output*; o microfone
+liga pelo painel. O encoder GPU (NVENC/AMF/QSV) é usado só se passar no teste;
+senão cai para libx264.
+
+### Linux
+
 Para quem só quer usar, são três comandos:
 
 ```bash
@@ -55,18 +78,20 @@ casa, rode uma vez `./tela-publica --instalar-cloudflared`.
 
 ## Requisitos
 
-Só roda em **Linux com sessão X11**. Wayland não serve, porque a captura de
-janela usa o X11. Na tela de login, clique na engrenagem e escolha X11 (às
-vezes aparece como Xorg). O programa avisa se você estiver em Wayland.
+Roda em **Windows 10/11** e em **Linux com sessão X11**. No Linux, Wayland não
+serve, porque a captura de janela usa o X11. Na tela de login, clique na
+engrenagem e escolha X11 (às vezes aparece como Xorg). O programa avisa se você
+estiver em Wayland.
 
-| Distribuição | Pacotes |
+| Sistema | Dependências |
 |---|---|
+| Windows 10/11 | Python 3.8+, FFmpeg (`winget install Gyan.FFmpeg`), cloudflared opcional |
 | Ubuntu, Debian, Mint, Pop!_OS | `ffmpeg wmctrl x11-utils x11-xserver-utils pulseaudio-utils pipewire-bin` |
 | Arch, Manjaro | `ffmpeg wmctrl xorg-xwininfo xorg-xrandr libpulse pipewire` |
 | Fedora | `ffmpeg wmctrl xorg-x11-utils xorg-x11-server-utils pulseaudio-utils pipewire` |
 
-Python 3.8 ou mais novo, sem nenhuma biblioteca de fora. O som separado por
-programa depende do PipeWire, que é o padrão nas distribuições atuais.
+Python 3.8 ou mais novo, sem nenhuma biblioteca de fora. No Linux, o som
+separado por programa depende do PipeWire.
 
 Quem assiste não precisa de nada além de um navegador atual.
 
