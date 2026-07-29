@@ -1,0 +1,2260 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+tela-publica
+Transmite uma janela do seu computador para alguem assistir pelo navegador,
+de qualquer lugar, sem instalar nada do outro lado.
+
+Ideias centrais:
+
+  Imagem   Sempre 1920x1080 a 30 fps. A janela entra centralizada nesse
+           quadro, entao a resolucao nunca muda no meio da transmissao.
+
+  Som      Sai apenas do programa da janela escolhida. Quem esta no
+           computador continua ouvindo tudo normalmente. O microfone entra
+           so quando o dono liga, para avisar alguma coisa.
+
+  Chat     Existe so na memoria. Nada vai para disco, nada fica gravado, e
+           cada mensagem some sozinha um minuto depois.
+
+Criado por caducosilva. Contato: abobicarlo@gmail.com
+"""
+
+import atexit
+import http.server
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import socketserver
+import subprocess
+import sys
+import threading
+import time
+import queue
+import secrets
+import urllib.parse
+from collections import deque
+from functools import partial
+
+VERSAO = "3.0"
+MARCA = "tela-publica · criado por caducosilva · contato: abobicarlo@gmail.com"
+
+PORTA_PREFERIDA = 8787
+DIR_CACHE = os.path.expanduser("~/.cache/tela-publica")
+ARQ_CONFIG = os.path.join(DIR_CACHE, "config.json")
+ARQ_LOG = os.path.join(DIR_CACHE, "tela-publica.log")
+RENDER_NODE = "/dev/dri/renderD128"
+SINK_MESA = "tela_publica"
+
+# Fechar o painel encerra tudo. Este e so o limite de seguranca para o caso
+# de o navegador congelar a aba em segundo plano.
+LIMITE_SEM_PING = 900
+
+# Qualidade. O nivel 0 e o padrao e so cai se a conexao de quem assiste pedir.
+NIVEIS = [
+    {"nome": "1080p", "larg": 1920, "alt": 1080, "fps": 30, "qp": 20, "kbps": 12000},
+    {"nome": "1080p", "larg": 1920, "alt": 1080, "fps": 30, "qp": 25, "kbps": 7000},
+    {"nome": "720p",  "larg": 1280, "alt": 720,  "fps": 30, "qp": 27, "kbps": 4000},
+    {"nome": "480p",  "larg": 854,  "alt": 480,  "fps": 30, "qp": 30, "kbps": 2000},
+]
+
+
+def log(*args):
+    """Registro tecnico. Nunca recebe conteudo de mensagem do chat."""
+    linha = time.strftime("[%H:%M:%S] ") + " ".join(str(a) for a in args)
+    try:
+        print(linha, flush=True)
+    except Exception:
+        pass
+
+
+# =========================================================== utilidades gerais
+
+def ambiente():
+    env = dict(os.environ)
+    env.setdefault("DISPLAY", ":0")
+    env.setdefault("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid())
+    return env
+
+
+def rodar(cmd, timeout=8):
+    """Executa um comando e devolve a saida, ou vazio se algo der errado."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=timeout, env=ambiente())
+        return p.stdout
+    except Exception:
+        return ""
+
+
+def porta_livre(host, preferida=0):
+    """Devolve um socket ja vinculado a uma porta livre de verdade."""
+    for tentativa in ([preferida] if preferida else []) + [0]:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind((host, tentativa))
+            return s
+        except OSError:
+            s.close()
+    raise RuntimeError("nenhuma porta disponivel")
+
+
+def ip_local():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("1.1.1.1", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+def ips_v6():
+    saida = rodar(["ip", "-6", "addr", "show", "scope", "global"])
+    achados = re.findall(r"inet6 ([0-9a-f:]+)/\d+(.*)", saida)
+    fixos, temporarios = [], []
+    for ip, resto in achados:
+        (temporarios if "temporary" in resto else fixos).append(ip)
+    return fixos + temporarios
+
+
+def fatiar(texto):
+    """Quebra um nome em palavras comparaveis: 'Google-chrome' vira {google, chrome}."""
+    return {p for p in re.split(r"[^a-z0-9]+", (texto or "").lower()) if len(p) > 2}
+
+
+def limpar_texto(bruto, maximo):
+    """Tira quebras de linha e caracteres de controle, e corta no tamanho."""
+    texto = re.sub(r"[\x00-\x1f\x7f]", " ", str(bruto or ""))
+    return texto.strip()[:maximo]
+
+
+# ================================================== janelas, telas e microfones
+
+def estado_janela(jid):
+    """Janela minimizada fica IsUnMapped e o X entrega zero quadros dela."""
+    saida = rodar(["xwininfo", "-id", jid], timeout=3)
+    if not saida.strip():
+        return "sumiu"
+    return "visivel" if "IsViewable" in saida else "minimizada"
+
+
+def janela_visivel(jid):
+    return estado_janela(jid) == "visivel"
+
+
+def restaurar_janela(jid):
+    rodar(["wmctrl", "-i", "-a", jid], timeout=3)
+    time.sleep(0.7)
+    return janela_visivel(jid)
+
+
+def listar_janelas():
+    saida = rodar(["wmctrl", "-l", "-G", "-p", "-x"])
+    janelas = []
+    for linha in saida.splitlines():
+        partes = linha.split(None, 9)
+        if len(partes) < 10:
+            continue
+        jid, mesa, pid, x, y, w, h, classe, _host, titulo = partes
+        if mesa == "-1":          # paineis e area de trabalho
+            continue
+        try:
+            w, h, pid = int(w), int(h), int(pid)
+        except ValueError:
+            continue
+        if w < 120 or h < 120:
+            continue
+        janelas.append({
+            "id": jid, "pid": pid,
+            "titulo": titulo.strip(),
+            "app": classe.split(".")[-1],
+            "classe": classe,
+            "w": w, "h": h,
+            "minimizada": not janela_visivel(jid),
+        })
+    return janelas
+
+
+def listar_telas():
+    saida = rodar(["xrandr", "--query"])
+    telas = []
+    for linha in saida.splitlines():
+        m = re.match(r"^(\S+) connected (?:primary )?(\d+)x(\d+)\+(\d+)\+(\d+)", linha)
+        if m:
+            nome, w, h, x, y = m.groups()
+            telas.append({"nome": nome, "w": int(w), "h": int(h),
+                          "x": int(x), "y": int(y)})
+    return telas
+
+
+def sink_padrao():
+    return rodar(["pactl", "get-default-sink"]).strip()
+
+
+def listar_microfones():
+    """Entradas de verdade, sem os monitores de saida."""
+    saida = rodar(["pactl", "list", "short", "sources"])
+    fontes = []
+    for linha in saida.splitlines():
+        campos = linha.split("\t")
+        if len(campos) < 2:
+            continue
+        nome = campos[1]
+        if nome.endswith(".monitor") or nome.startswith(SINK_MESA):
+            continue
+        rotulo = (nome.replace("alsa_input.", "")
+                      .replace("usb-", "").replace(".analog-stereo", "")
+                      .replace("_", " "))
+        fontes.append({"nome": nome, "rotulo": rotulo[:48]})
+    return fontes
+
+
+def tem_vaapi():
+    return os.path.exists(RENDER_NODE)
+
+
+def pw_dump():
+    try:
+        return json.loads(rodar(["pw-dump"]) or "[]")
+    except Exception:
+        return []
+
+
+# ============================================= conferencia do ambiente do micro
+
+# (comando, pacote no apt, para que serve, sem ele nao funciona)
+DEPENDENCIAS = [
+    ("ffmpeg",   "ffmpeg",            "capturar e comprimir a imagem",   True),
+    ("wmctrl",   "wmctrl",            "listar as janelas abertas",       True),
+    ("xwininfo", "x11-utils",         "ver se a janela esta na tela",    True),
+    ("xrandr",   "x11-xserver-utils", "listar os monitores",             False),
+    ("pactl",    "pulseaudio-utils",  "achar as fontes de som",          False),
+    ("pw-link",  "pipewire-bin",      "separar o som de um programa so", False),
+]
+
+
+def verificar_ambiente():
+    """Diz, em portugues claro, o que falta para funcionar."""
+    problemas = []
+    if os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland":
+        problemas.append({
+            "grave": True,
+            "texto": "Sua sessao esta em Wayland, e a captura de janela usa X11.",
+            "solucao": "Saia da conta, clique na engrenagem na tela de login e "
+                       "escolha a sessao X11 (as vezes chamada de Xorg).",
+        })
+    faltando = [d for d in DEPENDENCIAS if not shutil.which(d[0])]
+    if faltando:
+        pacotes = " ".join(sorted({d[1] for d in faltando}))
+        nomes = ", ".join("%s (%s)" % (d[0], d[2]) for d in faltando)
+        problemas.append({
+            "grave": any(d[3] for d in faltando),
+            "texto": "Faltam programas no sistema: " + nomes + ".",
+            "solucao": "Instale com: sudo apt install " + pacotes,
+        })
+    return problemas
+
+
+# ==================================================== mesa de som da transmissao
+
+class MesaDeSom:
+    """Decide o que vai ao ar em termos de audio.
+
+    Cria um destino de som proprio e liga nele apenas o que deve ser
+    transmitido: o programa da janela escolhida e, quando o dono quiser falar,
+    o microfone. As ligacoes sao adicionais, entao nada e tirado das caixas do
+    computador: quem esta na frente do micro continua ouvindo tudo.
+
+    A mistura acontece no PipeWire e nao no ffmpeg. Por isso ligar e desligar
+    o microfone e imediato e nao corta a imagem.
+    """
+
+    def __init__(self):
+        self.trava = threading.RLock()
+        self.modulo = None
+        self.pid_alvo = None
+        self.tokens = set()
+        self.usar_sistema = False      # quando o alvo e a tela inteira
+        self.mic = ""
+        self.mic_ligado = False
+        self.programa = ""
+        self.achou_programa = False
+        self.mic_no_ar = False
+        self.limpar_restos()
+        threading.Thread(target=self._laco, daemon=True).start()
+
+    # ---------------------------------------------------------------- destino
+
+    def monitor(self):
+        return SINK_MESA + ".monitor" if self.modulo else None
+
+    def limpar_restos(self):
+        """Remove destinos deixados para tras por uma execucao anterior."""
+        for linha in rodar(["pactl", "list", "short", "modules"]).splitlines():
+            if SINK_MESA in linha:
+                rodar(["pactl", "unload-module", linha.split("\t")[0]])
+
+    def _garantir_destino(self):
+        if self.modulo:
+            return True
+        saida = rodar(["pactl", "load-module", "module-null-sink",
+                       "sink_name=" + SINK_MESA,
+                       "sink_properties=device.description=Tela_publica"]).strip()
+        if saida.isdigit():
+            self.modulo = saida
+            log("destino de som criado (modulo %s)" % saida)
+            return True
+        return False
+
+    # ------------------------------------------------------------- o que entra
+
+    def definir_janela(self, pid, textos):
+        with self.trava:
+            self.pid_alvo = pid
+            self.tokens = set()
+            for t in textos:
+                self.tokens |= fatiar(t)
+            self.tokens -= {"com", "org", "github", "player", "www"}
+            self.usar_sistema = False
+        self._garantir_destino()
+        self._religar()
+
+    def definir_tela_inteira(self):
+        """Tela inteira nao tem um programa dono, entao vai o som geral."""
+        with self.trava:
+            self.pid_alvo = None
+            self.tokens = set()
+            self.usar_sistema = True
+        self._garantir_destino()
+        self._religar()
+
+    def definir_microfone(self, nome, ligado):
+        with self.trava:
+            self.mic = nome or ""
+            self.mic_ligado = bool(ligado and self.mic)
+        self._garantir_destino()
+        self._religar()          # imediato, para o mudo responder na hora
+
+    def desligar(self):
+        with self.trava:
+            self.pid_alvo = None
+            self.tokens = set()
+            self.usar_sistema = False
+            self.achou_programa = False
+            self.programa = ""
+        self._religar()
+
+    # ----------------------------------------------------------- as ligacoes
+
+    def _combina_programa(self, props):
+        pid = props.get("application.process.id")
+        try:
+            if pid is not None and self.pid_alvo and int(pid) == self.pid_alvo:
+                return True
+        except (TypeError, ValueError):
+            pass
+        # Nem todo programa expoe o PID (o Celluloid, por exemplo, entra pela
+        # camada de compatibilidade ALSA). Nesse caso vale o nome.
+        nomes = fatiar(" ".join(str(props.get(k, "")) for k in (
+            "node.name", "application.name", "application.process.binary",
+            "media.name")))
+        return bool(nomes & self.tokens)
+
+    def _religar(self):
+        with self.trava:
+            if not self.modulo:
+                return
+            quer_programa = bool(self.tokens or self.pid_alvo)
+            quer_sistema = self.usar_sistema
+            quer_mic = self.mic_ligado
+            mic = self.mic
+
+        dados = pw_dump()
+        if not dados:
+            return
+
+        nos, portas, ligacoes = {}, [], {}
+        for o in dados:
+            tipo = o.get("type", "")
+            info = o.get("info", {}) or {}
+            props = info.get("props", {}) or {}
+            if tipo.endswith("Node"):
+                nos[o["id"]] = props
+            elif tipo.endswith("Port"):
+                portas.append((o["id"], props))
+            elif tipo.endswith("Link"):
+                ligacoes[(info.get("output-port-id"), info.get("input-port-id"))] = o["id"]
+
+        destino = next((i for i, p in nos.items()
+                        if p.get("node.name") == SINK_MESA), None)
+        if destino is None:
+            return
+        entradas = {p.get("audio.channel"): i for i, p in portas
+                    if p.get("node.id") == destino and p.get("port.direction") == "in"}
+        if not entradas:
+            return
+
+        padrao = sink_padrao() if quer_sistema else ""
+        desejados, nome_programa, achou, mic_ativo = set(), "", False, False
+
+        for nid, props in nos.items():
+            if nid == destino:
+                continue
+            classe = props.get("media.class", "")
+            nome_no = props.get("node.name", "")
+            if quer_programa and classe == "Stream/Output/Audio" \
+                    and self._combina_programa(props):
+                desejados.add(nid)
+                achou = True
+                nome_programa = props.get("application.name") or nome_no
+            elif quer_sistema and classe == "Audio/Sink" and nome_no == padrao:
+                desejados.add(nid)          # monitor da saida padrao
+            elif quer_mic and classe == "Audio/Source" and nome_no == mic:
+                desejados.add(nid)
+                mic_ativo = True
+
+        # Cria o que falta.
+        for nid in desejados:
+            saidas = [(p.get("audio.channel"), i) for i, p in portas
+                      if p.get("node.id") == nid and p.get("port.direction") == "out"]
+            for canal, porta_saida in saidas:
+                alvos = ([entradas[canal]] if canal in entradas
+                         else list(entradas.values()))   # mono vai para os dois lados
+                for porta_entrada in alvos:
+                    if (porta_saida, porta_entrada) not in ligacoes:
+                        rodar(["pw-link", str(porta_saida), str(porta_entrada)])
+
+        # Desfaz o que nao deve mais estar no ar (o mudo do microfone cai aqui).
+        for (saida_id, entrada_id), link_id in ligacoes.items():
+            if entrada_id not in entradas.values():
+                continue
+            dono = next((p.get("node.id") for i, p in portas if i == saida_id), None)
+            if dono is not None and dono not in desejados:
+                rodar(["pw-link", "-d", str(saida_id), str(entrada_id)])
+
+        with self.trava:
+            self.achou_programa = achou
+            self.mic_no_ar = mic_ativo
+            if achou:
+                self.programa = re.sub(r"^PipeWire ALSA \[(.*)\]$", r"\1",
+                                       nome_programa)
+
+    def _laco(self):
+        """Mantem as ligacoes de pe: programas abrem e fecham o som o tempo todo."""
+        while True:
+            time.sleep(2.5)
+            try:
+                self._religar()
+            except Exception as e:
+                log("mesa de som:", e)
+
+    def estado(self):
+        with self.trava:
+            return {
+                "tem_destino": bool(self.modulo),
+                "achou_programa": self.achou_programa,
+                "programa": self.programa,
+                "microfone": self.mic,
+                "mic_ligado": self.mic_ligado,
+                "mic_no_ar": self.mic_no_ar,
+                "tela_inteira": self.usar_sistema,
+            }
+
+    def limpar(self):
+        with self.trava:
+            mod, self.modulo = self.modulo, None
+        if mod:
+            rodar(["pactl", "unload-module", mod])
+
+
+# ================================================================ chat efemero
+
+class Chat:
+    """Conversa que existe so enquanto acontece.
+
+    Nada e gravado em disco, nada entra no registro do programa e cada
+    mensagem desaparece um minuto depois de enviada. Serve para quem esta
+    assistindo avisar alguma coisa, nao para guardar historico.
+    """
+
+    VIDA = 60          # segundos ate a mensagem sumir
+    INTERVALO = 5      # cada pessoa pode mandar uma mensagem a cada 5 segundos
+    TETO = 60          # mensagens vivas ao mesmo tempo
+    MAX_TEXTO = 200
+    MAX_NOME = 20
+
+    def __init__(self):
+        self.trava = threading.Lock()
+        self.mensagens = deque(maxlen=self.TETO)
+        self.ultimo_envio = {}
+        self.sequencia = 0
+
+    def _limpar(self, agora):
+        while self.mensagens and agora - self.mensagens[0]["quando"] > self.VIDA:
+            self.mensagens.popleft()
+        for ip, quando in list(self.ultimo_envio.items()):
+            if agora - quando > 300:
+                del self.ultimo_envio[ip]
+
+    def enviar(self, quem, nome, texto):
+        agora = time.time()
+        nome = limpar_texto(nome, self.MAX_NOME) or "convidado"
+        texto = limpar_texto(texto, self.MAX_TEXTO)
+        with self.trava:
+            self._limpar(agora)
+            if not texto:
+                return False, "Escreva alguma coisa.", 0
+            espera = self.INTERVALO - (agora - self.ultimo_envio.get(quem, 0))
+            if espera > 0:
+                return False, "Espere um pouco para mandar de novo.", int(espera) + 1
+            self.ultimo_envio[quem] = agora
+            self.sequencia += 1
+            self.mensagens.append({"id": self.sequencia, "nome": nome,
+                                   "texto": texto, "quando": agora})
+            return True, "", 0
+
+    def recentes(self, desde=0):
+        agora = time.time()
+        with self.trava:
+            self._limpar(agora)
+            novas = [{"id": m["id"], "nome": m["nome"], "texto": m["texto"],
+                      "resta": round(self.VIDA - (agora - m["quando"]), 1)}
+                     for m in self.mensagens if m["id"] > desde]
+            return {"mensagens": novas, "ultimo": self.sequencia,
+                    "vivas": len(self.mensagens)}
+
+
+# ===================================================================== captura
+
+class Assinante:
+    # Cada item da fila e um trecho de cerca de 2 segundos de video. Uma fila
+    # comprida demoraria minutos para acusar que a banda nao esta dando conta,
+    # entao o limite e curto de proposito.
+    LIMITE = 12
+    ATRASO = 4
+
+    def __init__(self, gen):
+        self.gen = gen
+        self.fila = queue.Queue(maxsize=self.LIMITE)
+        self.viva = True
+
+    def enviar(self, dados):
+        try:
+            self.fila.put_nowait(dados)
+        except queue.Full:
+            self.viva = False       # ficou para tras, o navegador reconecta limpo
+            try:
+                while True:
+                    self.fila.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.fila.put_nowait(None)
+            except queue.Full:
+                pass
+
+    def encerrar(self):
+        self.viva = False
+        try:
+            self.fila.put_nowait(None)
+        except queue.Full:
+            pass
+
+
+PADRAO = {
+    "alvo": "",           # "janela:0x123" ou "tela:DP-2"
+    "microfone": "",      # node do microfone escolhido
+    "mic_ligado": False,
+}
+
+
+class Captura:
+    def __init__(self, mesa):
+        self.trava = threading.RLock()
+        self.mesa = mesa
+        self.opcoes = dict(PADRAO)
+        self.nivel = 0
+        self.codificador = "gpu" if tem_vaapi() else "cpu"
+        self.gen = 0
+        self.proc = None
+        self.init_seg = None
+        self.mime = ""
+        self.assinantes = set()
+        self.deve_rodar = False
+        self.estado = "parado"
+        self.erro = ""
+        self.aviso_nivel = ""
+        self.registro = []
+        self.velocidade = ""
+        self.bytes_janela = 0
+        self.kbps_real = 0
+        self.inicio = 0
+        self.falhas = 0
+        self.quedas = 0
+        self.dimensoes = ""
+        self.pausado_por_janela = False
+        threading.Thread(target=self._medidor, daemon=True).start()
+        threading.Thread(target=self._vigia_janela, daemon=True).start()
+
+    # ------------------------------------------------------------ ciclo de vida
+
+    def aplicar(self, novas):
+        with self.trava:
+            for k in PADRAO:
+                if k in novas:
+                    self.opcoes[k] = novas[k]
+            rodando = self.deve_rodar
+        self._ajustar_som()
+        if rodando:
+            with self.trava:
+                self._parar_processo()
+                self._iniciar_processo()
+
+    def ajustar_microfone(self, nome, ligado):
+        """Nao reinicia a captura: o mudo vale na hora."""
+        with self.trava:
+            self.opcoes["microfone"] = nome or ""
+            self.opcoes["mic_ligado"] = bool(ligado)
+        self.mesa.definir_microfone(nome, ligado)
+
+    def iniciar(self):
+        self._ajustar_som()
+        with self.trava:
+            self.deve_rodar = True
+            self.pausado_por_janela = False
+            self.falhas = 0
+            self.nivel = 0
+            self.aviso_nivel = ""
+            self._parar_processo()
+            self._iniciar_processo()
+
+    def parar(self):
+        with self.trava:
+            self.deve_rodar = False
+            self.pausado_por_janela = False
+            self._parar_processo()
+            self.estado = "parado"
+            self.erro = ""
+        self.mesa.desligar()
+
+    def _ajustar_som(self):
+        with self.trava:
+            alvo = self.opcoes["alvo"]
+            mic, ligado = self.opcoes["microfone"], self.opcoes["mic_ligado"]
+        tipo, _, ref = alvo.partition(":")
+        if tipo == "janela":
+            janela = next((j for j in listar_janelas() if j["id"] == ref), None)
+            if janela:
+                self.mesa.definir_janela(janela["pid"], [janela["classe"], janela["app"]])
+            else:
+                self.mesa.desligar()
+        elif tipo == "tela":
+            self.mesa.definir_tela_inteira()
+        else:
+            self.mesa.desligar()
+        self.mesa.definir_microfone(mic, ligado)
+
+    def _parar_processo(self):
+        p, self.proc = self.proc, None
+        self.init_seg = None
+        for a in list(self.assinantes):
+            a.encerrar()
+        self.assinantes.clear()
+        if p and p.poll() is None:
+            try:
+                p.terminate()
+                p.wait(timeout=3)
+            except Exception:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+
+    def _iniciar_processo(self):
+        if not self.opcoes["alvo"]:
+            self.estado = "escolha uma janela"
+            return
+        tipo, _, ref = self.opcoes["alvo"].partition(":")
+        if tipo == "janela" and not janela_visivel(ref):
+            # Minimizada, o X nega a captura. Tenta trazer de volta.
+            if not restaurar_janela(ref):
+                self.estado = "janela minimizada"
+                self.erro = ("Essa janela esta minimizada. Restaure ela na tela "
+                             "para poder transmitir.")
+                self.deve_rodar = False
+                return
+        cmd = self._montar_comando()
+        self.dimensoes = "%dx%d" % (NIVEIS[self.nivel]["larg"], NIVEIS[self.nivel]["alt"])
+        self.gen += 1
+        gen = self.gen
+        self.mime = self._mime()
+        self.registro = []
+        self.erro = ""
+        self.velocidade = ""
+        self.inicio = time.time()
+        log("captura gen", gen, "nivel", self.nivel, self.codificador)
+        try:
+            self.proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL, bufsize=0, env=ambiente())
+        except FileNotFoundError:
+            self.estado = "erro"
+            self.erro = "ffmpeg nao encontrado. Instale com: sudo apt install ffmpeg"
+            return
+        self.estado = "iniciando"
+        threading.Thread(target=self._leitor, args=(self.proc, gen), daemon=True).start()
+        threading.Thread(target=self._erros, args=(self.proc, gen), daemon=True).start()
+
+    def _montar_comando(self):
+        n = NIVEIS[self.nivel]
+        display = ambiente()["DISPLAY"]
+        gpu = self.codificador == "gpu" and tem_vaapi()
+
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin"]
+        if gpu:
+            cmd += ["-vaapi_device", RENDER_NODE]
+
+        # draw_mouse 0: o cursor do mouse nunca aparece para quem assiste.
+        cmd += ["-f", "x11grab", "-framerate", str(n["fps"]),
+                "-thread_queue_size", "1024", "-draw_mouse", "0"]
+
+        tipo, _, ref = self.opcoes["alvo"].partition(":")
+        if tipo == "janela":
+            cmd += ["-window_id", ref, "-i", display]
+        else:
+            telas = listar_telas()
+            tela = next((t for t in telas if t["nome"] == ref), None) or \
+                (telas[0] if telas else {"w": 1920, "h": 1080, "x": 0, "y": 0})
+            cmd += ["-video_size", "%dx%d" % (tela["w"], tela["h"]),
+                    "-i", "%s+%d,%d" % (display, tela["x"], tela["y"])]
+
+        fonte = self.mesa.monitor()
+        if fonte:
+            cmd += ["-f", "pulse", "-thread_queue_size", "1024", "-i", fonte]
+
+        # Quadro fixo: a janela cabe inteira dentro dele, sem distorcer, e o
+        # que sobrar vira tarja preta. Assim a resolucao nunca muda no meio.
+        filtros = [
+            "scale=%d:%d:force_original_aspect_ratio=decrease:flags=bicubic"
+            % (n["larg"], n["alt"]),
+            "pad=%d:%d:(ow-iw)/2:(oh-ih)/2" % (n["larg"], n["alt"]),
+            "format=nv12,hwupload" if gpu else "format=yuv420p",
+        ]
+        cmd += ["-vf", ",".join(filtros)]
+
+        gop = str(n["fps"] * 2)
+        if gpu:
+            # O driver desta placa so aceita CQP, entao a qualidade e fixa por
+            # quadro e nao por taxa. Ver a secao de problemas conhecidos.
+            cmd += ["-c:v", "h264_vaapi", "-profile:v", "high", "-level", "42",
+                    "-rc_mode", "CQP", "-qp", str(n["qp"]), "-g", gop, "-bf", "0"]
+        else:
+            k = n["kbps"]
+            cmd += ["-c:v", "libx264", "-preset", "veryfast",
+                    "-profile:v", "high", "-level", "4.2",
+                    "-b:v", "%dk" % k, "-maxrate", "%dk" % k,
+                    "-bufsize", "%dk" % (k * 2),
+                    "-g", gop, "-keyint_min", gop, "-sc_threshold", "0", "-bf", "2"]
+
+        if fonte:
+            cmd += ["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
+                    "-af", "aresample=async=1000", "-map", "0:v:0", "-map", "1:a:0"]
+        else:
+            cmd += ["-an", "-map", "0:v:0"]
+
+        cmd += ["-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+                "-flush_packets", "1", "-stats_period", "3",
+                "-progress", "pipe:2", "-f", "mp4", "pipe:1"]
+        return cmd
+
+    def _mime(self):
+        codecs = "avc1.64002A"
+        if self.mesa.monitor():
+            codecs += ", mp4a.40.2"
+        return 'video/mp4; codecs="%s"' % codecs
+
+    # -------------------------------------------------------- qualidade sozinha
+
+    def mudar_nivel(self, delta, motivo=""):
+        with self.trava:
+            novo = max(0, min(len(NIVEIS) - 1, self.nivel + delta))
+            if novo == self.nivel or not self.deve_rodar:
+                return False
+            self.nivel = novo
+            self.aviso_nivel = motivo
+            log("qualidade ->", NIVEIS[novo]["nome"], motivo)
+            self._parar_processo()
+            self._iniciar_processo()
+            return True
+
+    # ------------------------------------------------------- leitura do fluxo
+
+    @staticmethod
+    def _proxima_caixa(buf):
+        """Le uma caixa do MP4: 4 bytes de tamanho, 4 de tipo, depois o conteudo."""
+        if len(buf) < 8:
+            return None
+        tamanho = int.from_bytes(buf[0:4], "big")
+        tipo = bytes(buf[4:8])
+        if tamanho == 1:
+            if len(buf) < 16:
+                return None
+            tamanho = int.from_bytes(buf[8:16], "big")
+        if tamanho < 8:
+            raise ValueError("caixa mp4 invalida")
+        if len(buf) < tamanho:
+            return None
+        dados = bytes(buf[:tamanho])
+        del buf[:tamanho]
+        return tipo, dados
+
+    def _leitor(self, proc, gen):
+        buf, inicial, frag = bytearray(), bytearray(), bytearray()
+        pronto = False
+        try:
+            while True:
+                pedaco = proc.stdout.read(65536)
+                if not pedaco:
+                    break
+                buf += pedaco
+                while True:
+                    try:
+                        caixa = self._proxima_caixa(buf)
+                    except ValueError:
+                        buf.clear()
+                        break
+                    if caixa is None:
+                        break
+                    tipo, dados = caixa
+                    if not pronto:
+                        # ftyp + moov formam o cabecalho que todo navegador
+                        # precisa receber antes de qualquer imagem.
+                        if tipo in (b"ftyp", b"moov"):
+                            inicial += dados
+                            if tipo == b"moov":
+                                pronto = True
+                                with self.trava:
+                                    if gen == self.gen:
+                                        self.init_seg = bytes(inicial)
+                                        self.estado = "no ar"
+                                        self.falhas = 0
+                        continue
+                    if tipo == b"moof":
+                        frag = bytearray(dados)
+                    elif tipo == b"mdat" and frag:
+                        frag += dados
+                        self._difundir(gen, bytes(frag))
+                        frag = bytearray()
+        except Exception as e:
+            log("leitor:", e)
+        finally:
+            self._encerrou(proc, gen)
+
+    def _difundir(self, gen, dados):
+        with self.trava:
+            if gen != self.gen:
+                return
+            self.bytes_janela += len(dados)
+            for a in list(self.assinantes):
+                a.enviar(dados)
+                if not a.viva:
+                    self.assinantes.discard(a)
+                    self.quedas += 1
+
+    CHAVES_PROGRESSO = ("frame=", "fps=", "stream_", "bitrate=", "total_size=",
+                        "out_time", "dup_frames=", "drop_frames=", "speed=",
+                        "progress=")
+
+    def _erros(self, proc, gen):
+        for linha in iter(proc.stderr.readline, b""):
+            texto = linha.decode("utf-8", "replace").rstrip()
+            if not texto:
+                continue
+            if texto.startswith(self.CHAVES_PROGRESSO):
+                if texto.startswith("speed="):
+                    with self.trava:
+                        if gen == self.gen:
+                            self.velocidade = texto.split("=", 1)[1].strip()
+                continue
+            with self.trava:
+                if gen == self.gen:
+                    self.registro.append(texto)
+                    del self.registro[:-40]
+            log("ffmpeg:", texto)
+
+    def _encerrou(self, proc, gen):
+        time.sleep(0.2)
+        with self.trava:
+            if gen != self.gen:
+                return
+            codigo = proc.poll()
+            for a in list(self.assinantes):
+                a.encerrar()
+            self.assinantes.clear()
+            self.init_seg = None
+            if not self.deve_rodar:
+                self.estado = "parado"
+                return
+            self.falhas += 1
+            pistas = [l for l in self.registro
+                      if "rror" in l or "nvalid" in l or "ailed" in l]
+            self.erro = pistas[-1] if pistas else ("ffmpeg saiu com codigo %s" % codigo)
+            # A placa de video recusou: passa a comprimir pela CPU.
+            if self.codificador == "gpu" and self.falhas <= 2 and any(
+                    "vaapi" in l.lower() or "hwupload" in l.lower() for l in self.registro):
+                self.codificador = "cpu"
+                self.erro = ""
+                log("vaapi falhou, caindo para libx264")
+            if self.falhas >= 5:
+                self.deve_rodar = False
+                self.estado = "erro"
+                return
+            self.estado = "reconectando"
+        time.sleep(1.5)
+        with self.trava:
+            if self.deve_rodar and gen == self.gen:
+                self._parar_processo()
+                self._iniciar_processo()
+
+    def _medidor(self):
+        while True:
+            time.sleep(2)
+            with self.trava:
+                self.kbps_real = int(self.bytes_janela * 8 / 2 / 1000)
+                self.bytes_janela = 0
+
+    def _vigia_janela(self):
+        """Janela minimizada nao entrega imagem nenhuma. Em vez de transmitir o
+        nada, avisa e retoma sozinho quando ela voltar para a tela."""
+        while True:
+            time.sleep(3)
+            try:
+                with self.trava:
+                    tipo, _, ref = self.opcoes["alvo"].partition(":")
+                    rodando, pausado = self.deve_rodar, self.pausado_por_janela
+                if tipo != "janela" or not (rodando or pausado):
+                    continue
+                situacao = estado_janela(ref)
+                with self.trava:
+                    if situacao == "visivel" and pausado:
+                        self.pausado_por_janela = False
+                        self.deve_rodar = True
+                        self.erro = ""
+                        self.falhas = 0
+                        log("janela voltou, retomando")
+                        self._parar_processo()
+                        self._iniciar_processo()
+                    elif situacao != "visivel" and not pausado and rodando:
+                        self.pausado_por_janela = True
+                        self.deve_rodar = False
+                        self._parar_processo()
+                        if situacao == "sumiu":
+                            self.estado = "janela fechada"
+                            self.erro = "Essa janela foi fechada. Escolha outra na lista."
+                            self.pausado_por_janela = False
+                        else:
+                            self.estado = "janela minimizada"
+                            self.erro = ("A janela saiu da tela. Restaure ela e a "
+                                         "transmissão volta sozinha.")
+            except Exception as e:
+                log("vigia da janela:", e)
+
+    # ------------------------------------------------------------ quem assiste
+
+    def assinar(self):
+        with self.trava:
+            if not self.init_seg:
+                return None, None, None
+            a = Assinante(self.gen)
+            self.assinantes.add(a)
+            return a, self.init_seg, self.mime
+
+    def desassinar(self, a):
+        with self.trava:
+            self.assinantes.discard(a)
+            a.viva = False
+
+    def consumir_quedas(self):
+        with self.trava:
+            q, self.quedas = self.quedas, 0
+            return q
+
+    def congestionado(self):
+        with self.trava:
+            return any(a.fila.qsize() >= Assinante.ATRASO for a in self.assinantes)
+
+    def estado_atual(self):
+        with self.trava:
+            n = NIVEIS[self.nivel]
+            return {
+                "estado": self.estado,
+                "erro": self.erro,
+                "espectadores": len(self.assinantes),
+                "kbps": self.kbps_real,
+                "segundos": int(time.time() - self.inicio) if self.inicio and self.deve_rodar else 0,
+                "rodando": self.deve_rodar,
+                "opcoes": dict(self.opcoes),
+                "qualidade": n["nome"],
+                "nivel": self.nivel,
+                "fps": n["fps"],
+                "dimensoes": self.dimensoes,
+                "codificador": "placa de vídeo" if self.codificador == "gpu" else "CPU",
+                "velocidade": self.velocidade,
+                "aviso_nivel": self.aviso_nivel,
+                "som": self.mesa.estado(),
+                "registro": list(self.registro[-6:]),
+            }
+
+
+class Adaptador:
+    """Desce e sobe a qualidade sozinho, olhando como quem assiste esta indo."""
+
+    PACIENCIA = 180        # segundos de calmaria antes de tentar subir de novo
+
+    def __init__(self, captura, ctx):
+        self.captura = captura
+        self.ctx = ctx
+        self.apertado = 0
+        self.calmo_desde = time.time()
+        self.motivo = ""
+        threading.Thread(target=self._laco, daemon=True).start()
+
+    def diagnostico(self):
+        return {"calmo_ha": int(time.time() - self.calmo_desde),
+                "paciencia": self.PACIENCIA, "motivo": self.motivo}
+
+    def _laco(self):
+        while True:
+            time.sleep(5)
+            try:
+                self._avaliar()
+            except Exception as e:
+                log("adaptador:", e)
+
+    def _avaliar(self):
+        cap = self.captura
+        if not cap.deve_rodar or cap.estado != "no ar":
+            self.motivo = "captura parada"
+            return
+        quedas = cap.consumir_quedas()
+        saude = self.ctx.saude()
+        entupido = cap.congestionado()
+        if quedas or saude == "apertado" or entupido:
+            self.apertado += 1
+            self.calmo_desde = time.time()
+            self.motivo = "apertado (quedas=%d, saude=%s, fila=%s)" % (
+                quedas, saude, entupido)
+            if self.apertado >= 2:
+                self.apertado = 0
+                cap.mudar_nivel(+1, "a conexão de quem assiste não estava dando conta")
+            return
+        self.apertado = 0
+        self.motivo = "calmo (%s)" % saude
+        # Sem ninguem assistindo tambem vale voltar ao normal: nao ha sinal de
+        # aperto, e quando alguem entrar ja pega a qualidade cheia.
+        if saude in ("ok", "sem publico") and \
+                time.time() - self.calmo_desde > self.PACIENCIA:
+            self.calmo_desde = time.time()
+            cap.mudar_nivel(-1, "")
+
+
+# ======================================================================= tunel
+
+class Tunel:
+    """Link publico sem mexer no roteador, usando o cloudflared."""
+
+    def __init__(self):
+        self.proc = None
+        self.url = ""
+        self.estado = "desligado"
+
+    @property
+    def disponivel(self):
+        return shutil.which("cloudflared") is not None
+
+    def iniciar(self, porta):
+        if self.proc and self.proc.poll() is None:
+            return
+        if not self.disponivel:
+            self.estado = "cloudflared nao instalado"
+            return
+        self.url = ""
+        self.estado = "conectando"
+        self.proc = subprocess.Popen(
+            ["cloudflared", "tunnel", "--no-autoupdate", "--url",
+             "http://127.0.0.1:%d" % porta],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL, bufsize=1, text=True)
+        threading.Thread(target=self._ler, daemon=True).start()
+
+    def _ler(self):
+        padrao = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+        for linha in iter(self.proc.stderr.readline, ""):
+            m = padrao.search(linha)
+            if m and not self.url:
+                self.url = m.group(0)
+                self.estado = "no ar"
+                log("tunel no ar")
+        if self.estado == "conectando":
+            self.estado = "falhou"
+
+    def parar(self):
+        if self.proc and self.proc.poll() is None:
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=3)
+            except Exception:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+        self.proc = None
+        self.url = ""
+        self.estado = "desligado"
+
+
+# ==================================================================== contexto
+
+class Contexto:
+    def __init__(self):
+        self.mesa = MesaDeSom()
+        self.captura = Captura(self.mesa)
+        self.chat = Chat()
+        self.tunel = Tunel()
+        self.token = secrets.token_urlsafe(9)
+        self.chave_painel = secrets.token_urlsafe(12)
+        self.porta_publica = 0
+        self.porta_painel = 0
+        self.visores = {}
+        self.ultimo_ping = 0
+        self.viu_painel = False
+        self.encerrando = False
+        self.timer_saida = None
+        self.problemas = verificar_ambiente()
+        self.carregar()
+        self.adaptador = Adaptador(self.captura, self)
+
+    def carregar(self):
+        try:
+            with open(ARQ_CONFIG) as f:
+                salvo = json.load(f)
+            for k in PADRAO:
+                if k in salvo:
+                    self.captura.opcoes[k] = salvo[k]
+        except Exception:
+            pass
+
+    def salvar(self):
+        try:
+            os.makedirs(DIR_CACHE, exist_ok=True)
+            guardar = {k: v for k, v in self.captura.opcoes.items() if k != "alvo"}
+            with open(ARQ_CONFIG, "w") as f:
+                json.dump(guardar, f)
+        except Exception:
+            pass
+
+    def saude(self):
+        agora = time.time()
+        vivos = [v for v in self.visores.values() if agora - v["quando"] < 15]
+        if not vivos:
+            return "sem publico"
+        for v in vivos:
+            # Os primeiros segundos nao contam: ainda esta enchendo o buffer.
+            if agora - v.get("desde", agora) < 12:
+                continue
+            if v["buffer"] < 0.4:
+                return "apertado"
+        return "ok"
+
+    def agendar_saida(self, segundos=6):
+        """Fechar o painel encerra tudo, mas um F5 nao pode matar a transmissao.
+        Por isso a saida espera o painel voltar antes de valer."""
+        self.cancelar_saida()
+        self.timer_saida = threading.Timer(segundos, self.encerrar)
+        self.timer_saida.daemon = True
+        self.timer_saida.start()
+
+    def cancelar_saida(self):
+        if self.timer_saida:
+            self.timer_saida.cancel()
+            self.timer_saida = None
+
+    def url_publica(self):
+        return "%s/v/%s" % (self.tunel.url, self.token) if self.tunel.url else ""
+
+    def urls_diretas(self):
+        saida = ["http://%s:%d/v/%s" % (ip_local(), self.porta_publica, self.token)]
+        for ip in ips_v6()[:1]:
+            saida.append("http://[%s]:%d/v/%s" % (ip, self.porta_publica, self.token))
+        return saida
+
+    def encerrar(self):
+        if self.encerrando:
+            return
+        self.encerrando = True
+        log("encerrando")
+        self.salvar()
+        for acao in (self.captura.parar, self.tunel.parar, self.mesa.limpar):
+            try:
+                acao()
+            except Exception:
+                pass
+        threading.Timer(0.6, lambda: os._exit(0)).start()
+
+
+# ===================================================================== paginas
+
+PAGINA_BASE = """
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<style>
+:root{color-scheme:light dark;
+--bg:#fbfbfa;--cx:#fff;--tx:#1a1a19;--mut:#6b6b68;--bd:#e3e3e0;
+--ac:#2f6f4e;--er:#a3382f;--sel:#eef4f0}
+@media (prefers-color-scheme:dark){:root{
+--bg:#131313;--cx:#1c1c1b;--tx:#ececea;--mut:#9a9a96;--bd:#2e2e2c;
+--ac:#5fb98a;--er:#e0796d;--sel:#1e2a24}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--tx);
+font:16px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+-webkit-font-smoothing:antialiased;-webkit-tap-highlight-color:transparent}
+h1{font-size:19px;font-weight:600;margin:0}
+h2{font-size:12px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;
+color:var(--mut);margin:0 0 10px}
+button,select,input{font:inherit;color:inherit}
+button{background:var(--cx);border:1px solid var(--bd);border-radius:9px;
+padding:9px 15px;cursor:pointer;min-height:42px;
+transition:transform .06s ease,background .12s ease,border-color .12s ease}
+button:hover{border-color:var(--mut)}
+button:active{transform:scale(.96);background:var(--sel)}
+button:focus-visible,select:focus-visible,input:focus-visible{
+outline:2px solid var(--ac);outline-offset:2px}
+button.p{background:var(--ac);border-color:var(--ac);color:#fff;font-weight:500}
+button.p:hover{filter:brightness(1.08)}
+button[disabled]{opacity:.5;cursor:progress;transform:none}
+select,input[type=text]{background:var(--cx);border:1px solid var(--bd);
+border-radius:9px;padding:9px 11px;width:100%;min-height:42px}
+</style>
+"""
+
+PAGINA_PAINEL = PAGINA_BASE + """
+<title>Tela publica</title>
+<style>
+.env{max-width:840px;margin:0 auto;padding:22px 18px 60px}
+.topo{display:flex;align-items:center;gap:12px;margin-bottom:18px}
+.pt{width:9px;height:9px;border-radius:50%;background:var(--mut);flex:none;
+transition:background .2s}
+.pt.on{background:var(--ac)}.pt.er{background:var(--er)}
+.cx{background:var(--cx);border:1px solid var(--bd);border-radius:12px;
+padding:16px;margin-bottom:14px}
+.lin{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.jn{max-height:230px;overflow:auto;border:1px solid var(--bd);border-radius:9px}
+.jn div{padding:12px;cursor:pointer;border-bottom:1px solid var(--bd);
+display:flex;justify-content:space-between;gap:10px;align-items:center;
+transition:background .12s}
+.jn div:last-child{border-bottom:0}
+.jn div:hover{background:var(--sel)}
+.jn div.sel{background:var(--ac);color:#fff}
+.jn small{opacity:.75;flex:none;font-size:12px}
+.jn span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lnk{display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap}
+.lnk input{font-family:ui-monospace,monospace;font-size:13px;flex:1;min-width:180px}
+.mut{color:var(--mut);font-size:13.5px}
+.er{color:var(--er);font-size:13.5px}
+.aviso{border:1px solid var(--er);border-radius:12px;padding:14px;margin-bottom:14px}
+.aviso code{background:var(--sel);padding:2px 6px;border-radius:5px;
+font-size:13px;display:inline-block;margin-top:6px}
+pre{margin:8px 0 0;font-size:12px;color:var(--mut);white-space:pre-wrap;
+max-height:90px;overflow:auto}
+.mic{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.mic button{min-width:150px}
+.mic button.on{background:var(--ac);border-color:var(--ac);color:#fff}
+.q{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+#msgs{max-height:190px;overflow:auto;display:flex;flex-direction:column;gap:7px;
+margin-bottom:10px}
+.msg{background:var(--bg);border:1px solid var(--bd);border-radius:9px;
+padding:7px 11px;font-size:14.5px;animation:ap .2s ease}
+.msg b{color:var(--ac);margin-right:6px}
+.msg.saindo{opacity:0;transition:opacity .8s}
+@keyframes ap{from{opacity:0;transform:translateY(4px)}to{opacity:1}}
+@media (max-width:560px){.env{padding:16px 12px 40px}.lnk input{min-width:0}}
+</style>
+<div class="env">
+  <div class="topo"><span class="pt" id="pt"></span><h1>Tela publica</h1>
+    <span class="mut" id="resumo" style="margin-left:auto"></span></div>
+
+  <div id="problemas"></div>
+
+  <div class="cx">
+    <h2>O que transmitir</h2>
+    <div class="jn" id="jn"></div>
+    <div class="mut" style="margin-top:10px">A lista se atualiza sozinha. Clique
+      na janela que quer mostrar e ela troca na hora, sem quem assiste precisar
+      recarregar nada.</div>
+  </div>
+
+  <div class="cx">
+    <h2>Som</h2>
+    <div class="mut" id="som-info"></div>
+    <div class="mic" style="margin-top:12px">
+      <button id="bmic" onclick="alternarMic(this)">Microfone desligado</button>
+      <select id="mic" style="flex:1;min-width:200px"></select>
+    </div>
+    <div class="mut" style="margin-top:8px">Ligue o microfone so quando quiser
+      falar com quem esta assistindo. Voce nao se ouve.</div>
+  </div>
+
+  <div class="cx">
+    <h2>Qualidade</h2>
+    <div class="q" id="q"></div>
+    <div class="mut" style="margin-top:8px">Fixo em 1920x1080 a 30 fps. So cai
+      sozinha se a conexao de quem assiste nao aguentar, e volta ao normal
+      quando estabilizar.</div>
+  </div>
+
+  <div class="cx">
+    <h2>Link para quem vai assistir</h2>
+    <div id="tunel"></div>
+    <div id="diretos"></div>
+  </div>
+
+  <div class="cx">
+    <h2>Chat</h2>
+    <div id="msgs"></div>
+    <div class="lin">
+      <input type="text" id="apelido" placeholder="seu apelido" maxlength="20"
+             style="max-width:150px">
+      <input type="text" id="texto" placeholder="escreva e aperte Enter"
+             maxlength="200" style="flex:1;min-width:160px">
+      <button onclick="mandar(this)">Enviar</button>
+    </div>
+    <div class="mut" id="chat-aviso" style="margin-top:8px">As mensagens somem
+      sozinhas depois de um minuto e nada fica gravado.</div>
+  </div>
+
+  <div class="cx">
+    <div class="lin">
+      <button class="p" id="btn" onclick="alternar(this)">Comecar</button>
+      <button onclick="encerrar(this)">Encerrar</button>
+      <span class="mut" id="status" style="margin-left:auto"></span>
+    </div>
+    <div class="er" id="erro" style="margin-top:8px"></div>
+    <pre id="reg"></pre>
+  </div>
+
+  <div class="mut" style="text-align:center;margin-top:22px">
+    tela-publica · criado por caducosilva</div>
+</div>
+<script>
+const D = __DADOS__;
+const $ = i => document.getElementById(i);
+let est = {}, alvo = "", assinaturas = {}, ultimoChat = 0;
+
+function api(rota, corpo){
+  return fetch(rota + "?k=" + D.chave, {
+    method: corpo ? "POST" : "GET",
+    headers: {"Content-Type":"application/json"},
+    body: corpo ? JSON.stringify(corpo) : undefined
+  }).then(r => r.json());
+}
+
+// Segura o botao enquanto o pedido corre, para o clique nunca parecer perdido.
+// So mexe no estado de habilitado: quem manda no texto e o pintar().
+function ocupado(btn, promessa){
+  if (!btn) return promessa;
+  btn.disabled = true;
+  return promessa.finally(() => { btn.disabled = false; });
+}
+
+function listar(){
+  return api("/api/fontes").then(d => {
+    const itens = [];
+    d.telas.forEach(t => itens.push({v:"tela:"+t.nome,
+      t:"Tela inteira (" + t.nome + ")", s:t.w + "x" + t.h}));
+    d.janelas.forEach(j => itens.push({v:"janela:"+j.id, t:j.titulo || j.app,
+      s:(j.minimizada ? "minimizada  " : "") + j.app, min:j.minimizada}));
+    const assina = JSON.stringify(itens) + "|" + alvo;
+    if (assinaturas.jn !== assina){          // so redesenha se mudou de verdade
+      assinaturas.jn = assina;
+      const jn = $("jn"); jn.innerHTML = "";
+      itens.forEach(it => {
+        const el = document.createElement("div");
+        el.innerHTML = "<span></span><small></small>";
+        el.firstChild.textContent = it.t;
+        el.lastChild.textContent = it.s;
+        if (it.min) el.style.opacity = ".55";
+        if (it.v === alvo) el.className = "sel";
+        el.onclick = () => {
+          alvo = it.v;
+          [...jn.children].forEach(c => c.className = "");
+          el.className = "sel";
+          assinaturas.jn = null;
+          api("/api/opcoes", {alvo: alvo}).then(pintar);
+        };
+        jn.appendChild(el);
+      });
+      if (!itens.length) jn.innerHTML = "<div>Nenhuma janela aberta</div>";
+    }
+    const assinaM = JSON.stringify(d.microfones);
+    if (assinaturas.mic !== assinaM){
+      assinaturas.mic = assinaM;
+      const f = $("mic"); const antes = f.value || D.opcoes.microfone;
+      f.innerHTML = "";
+      if (!d.microfones.length){
+        const o = document.createElement("option");
+        o.value = ""; o.textContent = "nenhum microfone encontrado";
+        f.appendChild(o);
+      }
+      d.microfones.forEach(m => {
+        const o = document.createElement("option");
+        o.value = m.nome; o.textContent = m.rotulo; f.appendChild(o);
+      });
+      if ([...f.options].some(o => o.value === antes)) f.value = antes;
+    }
+  });
+}
+
+function alternarMic(btn){
+  const ligar = !(est.opcoes && est.opcoes.mic_ligado);
+  return ocupado(btn, api("/api/microfone",
+    {microfone: $("mic").value, mic_ligado: ligar}).then(pintar));
+}
+
+function alternar(btn){
+  btn.textContent = est.rodando ? "Parando..." : "Iniciando...";
+  return ocupado(btn, api(est.rodando ? "/api/parar" : "/api/iniciar",
+    {alvo: alvo}).then(e => { pintar(e); listar(); }));
+}
+
+function encerrar(btn){
+  if (!confirm("Encerrar tudo e liberar a porta?")) return;
+  btn.disabled = true;
+  fetch("/api/encerrar?agora=1&k=" + D.chave, {method:"POST"}).catch(()=>{});
+  document.body.innerHTML = "<div class='env'><h1>Encerrado</h1>" +
+    "<p class='mut'>A porta foi liberada. Pode fechar esta janela.</p></div>";
+}
+
+function caixaLink(url, publico){
+  const cx = document.createElement("div");
+  cx.className = "lnk";
+  const i = document.createElement("input");
+  i.type = "text"; i.readOnly = true; i.value = url;
+  i.onclick = () => i.select();
+  const b = document.createElement("button");
+  b.textContent = "Copiar";
+  b.onclick = () => {
+    navigator.clipboard.writeText(url);
+    b.textContent = "Copiado";
+    setTimeout(() => b.textContent = "Copiar", 1500);
+  };
+  cx.appendChild(i); cx.appendChild(b);
+  if (publico){
+    const w = document.createElement("button");
+    w.textContent = "WhatsApp";
+    w.onclick = () => window.open("https://wa.me/?text=" + encodeURIComponent(url), "_blank");
+    cx.appendChild(w);
+  }
+  return cx;
+}
+
+function pintarLinks(){
+  // Redesenhar isto a cada 2s atrapalharia copiar o link, entao so muda quando
+  // a lista de enderecos muda de verdade.
+  const assina = est.url_publica + "|" + (est.urls_diretas||[]).join("|") + "|" + est.tunel;
+  if (assinaturas.links === assina) return;
+  assinaturas.links = assina;
+  const t = $("tunel"); t.innerHTML = "";
+  const m = document.createElement("div");
+  m.className = "mut";
+  if (est.url_publica){
+    m.textContent = "Funciona de qualquer lugar, sem mexer no roteador.";
+    t.appendChild(m);
+    t.appendChild(caixaLink(est.url_publica, true));
+  } else if (est.tunel === "conectando"){
+    m.textContent = "Abrindo o tunel...";
+    t.appendChild(m);
+  } else if (est.tunel_disponivel){
+    m.textContent = "Sem link publico ativo. ";
+    const a = document.createElement("button");
+    a.textContent = "Ligar agora";
+    a.onclick = () => ocupado(a, api("/api/tunel").then(pintar));
+    m.appendChild(a);
+    t.appendChild(m);
+  } else {
+    m.textContent = "Para gerar link de fora da sua rede, instale o cloudflared: " +
+      "tela-publica --instalar-cloudflared";
+    t.appendChild(m);
+  }
+  const dd = $("diretos");
+  dd.innerHTML = "";
+  const m2 = document.createElement("div");
+  m2.className = "mut"; m2.style.marginTop = "14px";
+  m2.textContent = "Na mesma rede de casa:";
+  dd.appendChild(m2);
+  (est.urls_diretas||[]).forEach(u => dd.appendChild(caixaLink(u, false)));
+}
+
+function pintarProblemas(){
+  if (assinaturas.problemas) return;
+  assinaturas.problemas = true;
+  const cx = $("problemas");
+  (est.problemas || []).forEach(p => {
+    const d = document.createElement("div");
+    d.className = "aviso";
+    const t = document.createElement("div");
+    t.textContent = p.texto;
+    const s = document.createElement("code");
+    s.textContent = p.solucao;
+    d.appendChild(t); d.appendChild(s);
+    cx.appendChild(d);
+  });
+}
+
+function pintar(e){
+  if (e) est = e;
+  if (!est.opcoes) return;
+  if (!alvo && est.opcoes.alvo) alvo = est.opcoes.alvo;
+  pintarProblemas();
+  pintarLinks();
+
+  $("pt").className = "pt" + (est.estado === "no ar" ? " on" :
+    (est.estado === "erro" ? " er" : ""));
+  $("btn").textContent = est.rodando ? "Parar" : "Comecar";
+
+  const vs = est.visores || [];
+  const tocando = vs.filter(x => x.tocando).length;
+  let quem = est.espectadores + " conectado(s)";
+  if (tocando) quem = tocando + " assistindo, " +
+    Math.round(Math.max(...vs.map(x => x.buffer)) * 10) / 10 + "s de folga";
+  $("status").textContent = est.estado + (est.rodando ? "  |  " + quem : "");
+  $("resumo").textContent = est.rodando ?
+    "no ar ha " + Math.floor(est.segundos/60) + " min" : "";
+
+  const q = $("q");
+  q.innerHTML = "";
+  const b = document.createElement("b");
+  b.textContent = est.qualidade + (est.dimensoes ? " (" + est.dimensoes + ")" : "");
+  q.appendChild(b);
+  const det = document.createElement("span");
+  det.className = "mut";
+  det.textContent = est.fps + " fps  |  " + est.kbps + " kbps  |  comprimindo pela " +
+    est.codificador + (est.velocidade ? "  |  " + est.velocidade : "");
+  q.appendChild(det);
+  if (est.aviso_nivel){
+    const a = document.createElement("span");
+    a.className = "er"; a.textContent = est.aviso_nivel;
+    q.appendChild(a);
+  }
+
+  const s = est.som || {};
+  const info = $("som-info");
+  if (!est.opcoes.alvo) info.textContent = "Escolha uma janela acima.";
+  else if (!s.tem_destino)
+    info.textContent = "Nao consegui separar o som, entao a transmissao vai muda.";
+  else if (s.tela_inteira)
+    info.textContent = "Tela inteira nao tem um programa dono, entao vai o som geral.";
+  else if (s.achou_programa)
+    info.innerHTML = "Indo so o som de <b>" + (s.programa || "programa") +
+      "</b>. Voce continua ouvindo tudo normalmente.";
+  else
+    info.textContent = "Esperando esse programa tocar algum som. Nada mais do " +
+      "computador vai junto.";
+
+  const bm = $("bmic");
+  const ligado = est.opcoes.mic_ligado;
+  bm.className = ligado ? "on" : "";
+  bm.textContent = ligado ? (s.mic_no_ar ? "Microfone no ar" : "Ligando microfone...")
+                          : "Microfone desligado";
+
+  $("erro").textContent = est.erro || "";
+  $("reg").textContent = (est.registro || []).join("\\n");
+}
+
+// ------------------------------------------------------------------- o chat
+
+function adicionar(m){
+  const el = document.createElement("div");
+  el.className = "msg";
+  const b = document.createElement("b");
+  b.textContent = m.nome;
+  el.appendChild(b);
+  el.appendChild(document.createTextNode(m.texto));
+  $("msgs").appendChild(el);
+  $("msgs").scrollTop = $("msgs").scrollHeight;
+  // Some sozinha quando a vida dela acaba do lado do servidor.
+  setTimeout(() => { el.className = "msg saindo";
+    setTimeout(() => el.remove(), 800); }, Math.max(1, m.resta) * 1000);
+}
+
+function puxarChat(){
+  api("/api/chat?desde=" + ultimoChat).then(d => {
+    ultimoChat = d.ultimo;
+    (d.mensagens || []).forEach(adicionar);
+  }).catch(()=>{});
+}
+
+function mandar(btn){
+  const texto = $("texto").value.trim();
+  if (!texto) return;
+  const nome = $("apelido").value.trim() || "anfitriao";
+  localStorage.setItem("tp_apelido", nome);
+  return ocupado(btn, api("/api/chat", {nome: nome, texto: texto}).then(d => {
+    if (d.ok){ $("texto").value = ""; puxarChat(); }
+    else $("chat-aviso").textContent = d.erro;
+  }));
+}
+
+$("texto").addEventListener("keydown", ev => {
+  if (ev.key === "Enter") mandar();
+});
+$("apelido").value = localStorage.getItem("tp_apelido") || "";
+
+listar();
+api("/api/estado").then(pintar);
+setInterval(() => api("/api/estado").then(pintar), 2000);
+setInterval(listar, 10000);
+setInterval(puxarChat, 2000);
+setInterval(() => api("/api/ping", {}), 5000);
+window.addEventListener("pagehide", () =>
+  navigator.sendBeacon("/api/encerrar?k=" + D.chave));
+</script>
+"""
+
+PAGINA_VISOR = PAGINA_BASE + """
+<title>Transmissao ao vivo</title>
+<style>
+html,body{height:100%;background:#000;color:#eee;overflow:hidden}
+body{display:flex;align-items:center;justify-content:center}
+video{width:100%;height:100%;object-fit:contain;background:#000}
+#capa{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;
+justify-content:center;gap:18px;background:#000;text-align:center;padding:24px;z-index:5}
+#capa button{background:#fff;color:#111;border:0;border-radius:999px;
+padding:16px 42px;font-size:17px;font-weight:600;min-height:54px}
+#capa button:active{transform:scale(.95);background:#ddd}
+#barra{position:fixed;top:0;right:0;padding:12px;display:flex;gap:8px;z-index:3;
+opacity:0;transition:opacity .25s}
+#barra.on{opacity:1}
+#barra button{background:#000a;color:#fff;border:1px solid #fff3;border-radius:999px;
+padding:11px 18px;font-size:14px;backdrop-filter:blur(8px);min-height:44px}
+#aviso{position:fixed;top:14px;left:50%;transform:translateX(-50%);background:#000a;
+padding:8px 15px;border-radius:999px;font-size:13px;opacity:0;transition:.3s;
+pointer-events:none;backdrop-filter:blur(6px);z-index:6}
+#aviso.on{opacity:1}
+#chat{position:fixed;left:0;bottom:0;width:min(360px,100%);padding:12px;z-index:4;
+display:flex;flex-direction:column;gap:8px;pointer-events:none}
+#lista{display:flex;flex-direction:column;gap:6px;max-height:38vh;overflow:hidden;
+justify-content:flex-end}
+#lista div{background:#000000b3;border-radius:10px;padding:7px 11px;font-size:14.5px;
+backdrop-filter:blur(8px);animation:ap .2s ease;word-break:break-word}
+#lista div b{color:#7fd6a8;margin-right:6px}
+#lista div.saindo{opacity:0;transition:opacity .8s}
+@keyframes ap{from{opacity:0;transform:translateY(6px)}to{opacity:1}}
+#form{display:flex;gap:7px;pointer-events:auto;opacity:.55;transition:opacity .2s}
+#form:focus-within,#form.on{opacity:1}
+#form input{background:#000000b3;border:1px solid #fff3;color:#fff;border-radius:999px;
+padding:10px 15px;min-height:44px;backdrop-filter:blur(8px)}
+#form input::placeholder{color:#fff8}
+#nome{max-width:110px}
+#form button{background:#fffffff2;color:#111;border:0;border-radius:999px;
+padding:10px 17px;font-weight:600;min-height:44px}
+@media (max-width:560px){#chat{width:100%}#lista{max-height:30vh}}
+</style>
+<video id="v" playsinline controls></video>
+<div id="barra"><button id="bfs" onclick="telaCheia()">Tela cheia</button></div>
+<div id="aviso"></div>
+<div id="chat">
+  <div id="lista"></div>
+  <div id="form">
+    <input type="text" id="nome" placeholder="apelido" maxlength="20">
+    <input type="text" id="texto" placeholder="mandar mensagem" maxlength="200"
+           style="flex:1">
+    <button onclick="mandar()">Ok</button>
+  </div>
+</div>
+<div id="capa">
+  <div style="font-size:15px;opacity:.8">Transmissao ao vivo</div>
+  <button onclick="comecar()">Assistir</button>
+</div>
+<script>
+const T = location.pathname.split("/").pop();
+const v = document.getElementById("v");
+const MS = window.ManagedMediaSource || window.MediaSource;
+let ms, sb, fila = [], ativo = true, ultimoChat = 0;
+
+function aviso(t){
+  const a = document.getElementById("aviso");
+  a.textContent = t; a.className = t ? "on" : "";
+}
+
+function comecar(){
+  document.getElementById("capa").style.display = "none";
+  v.play().catch(() => {});
+  mostrarBarra();
+}
+v.addEventListener("playing", () => {
+  document.getElementById("capa").style.display = "none";
+});
+
+// ------------------------------------------------- tela cheia deitando o celular
+
+async function telaCheia(){
+  try{
+    if (!document.fullscreenElement && !document.webkitFullscreenElement){
+      const alvo = document.documentElement;
+      if (alvo.requestFullscreen) await alvo.requestFullscreen({navigationUI:"hide"});
+      else if (alvo.webkitRequestFullscreen) alvo.webkitRequestFullscreen();
+      else if (v.webkitEnterFullscreen){ v.webkitEnterFullscreen(); return; }
+      // No iPhone esta API nao existe e quem gira a tela e o proprio player.
+      try{ await screen.orientation.lock("landscape"); }catch(e){}
+    } else {
+      try{ screen.orientation.unlock(); }catch(e){}
+      if (document.exitFullscreen) await document.exitFullscreen();
+      else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+    }
+  }catch(e){}
+  atualizarBotao();
+}
+
+function atualizarBotao(){
+  const cheio = !!(document.fullscreenElement || document.webkitFullscreenElement);
+  document.getElementById("bfs").textContent = cheio ? "Sair da tela cheia" : "Tela cheia";
+}
+document.addEventListener("fullscreenchange", atualizarBotao);
+document.addEventListener("webkitfullscreenchange", atualizarBotao);
+
+let ultimoToque = 0;
+v.addEventListener("click", () => {
+  const agora = Date.now();
+  if (agora - ultimoToque < 350) telaCheia();
+  ultimoToque = agora;
+  mostrarBarra();
+});
+
+let sumir;
+function mostrarBarra(){
+  const b = document.getElementById("barra");
+  b.className = "on";
+  clearTimeout(sumir);
+  sumir = setTimeout(() => b.className = "", 3500);
+}
+document.addEventListener("mousemove", mostrarBarra);
+document.addEventListener("touchstart", mostrarBarra, {passive:true});
+
+// ------------------------------------------------------------------ o video
+
+async function conectar(){
+  if (!ativo) return;
+  try{
+    const r = await fetch("/stream?t=" + T, {cache:"no-store"});
+    if (!r.ok){
+      aviso(r.status === 404 ? "Aguardando comecar" : "Sem acesso");
+      return setTimeout(conectar, 2500);
+    }
+    const mime = r.headers.get("X-Mime") || 'video/mp4; codecs="avc1.64002A"';
+    if (!MS || !MS.isTypeSupported(mime)){
+      return aviso("Este navegador nao consegue tocar a transmissao");
+    }
+    ms = new MS();
+    v.disableRemotePlayback = true;
+    if (window.ManagedMediaSource && ms instanceof window.ManagedMediaSource){
+      v.srcObject = ms;               // caminho do Safari no iPhone
+    } else {
+      v.src = URL.createObjectURL(ms);
+    }
+    await new Promise(ok => ms.addEventListener("sourceopen", ok, {once:true}));
+    sb = ms.addSourceBuffer(mime);
+    // O relogio do video comeca no instante em que a captura subiu, entao o
+    // primeiro trecho pula para o inicio do que existe no buffer.
+    sb.addEventListener("updateend", () => { alinhar(); bombear(); });
+    fila = [];
+    aviso("");
+    const leitor = r.body.getReader();
+    while (true){
+      const {done, value} = await leitor.read();
+      if (done) break;
+      fila.push(value);
+      bombear();
+    }
+  }catch(e){ /* queda de conexao */ }
+  finally{
+    try{ ms && ms.readyState === "open" && ms.endOfStream(); }catch(e){}
+    sb = null;
+    if (ativo){ aviso("Reconectando"); setTimeout(conectar, 800); }
+  }
+}
+
+function alinhar(){
+  if (!sb) return;
+  const b = sb.buffered;
+  if (!b.length) return;
+  if (v.currentTime < b.start(0) || v.currentTime > b.end(b.length - 1)){
+    v.currentTime = Math.max(b.start(0), b.end(b.length - 1) - 1.2);
+  }
+}
+
+function bombear(){
+  if (!sb || sb.updating || !fila.length) return;
+  let n = 0;
+  for (const p of fila) n += p.byteLength;
+  const juntos = new Uint8Array(n);
+  let off = 0;
+  for (const p of fila){ juntos.set(p, off); off += p.byteLength; }
+  fila = [];
+  try{
+    sb.appendBuffer(juntos);
+  }catch(e){
+    if (e.name === "QuotaExceededError"){
+      try{
+        const b = sb.buffered;
+        if (b.length) sb.remove(b.start(0), Math.max(b.start(0), v.currentTime - 4));
+      }catch(_){}
+    }
+  }
+  if (v.paused && v.readyState >= 2) v.play().catch(()=>{});
+}
+
+setInterval(() => {
+  if (!sb || sb.updating) return;
+  const b = sb.buffered;
+  if (!b.length) return;
+  const fim = b.end(b.length - 1);
+  // Mantem a reproducao colada na ponta ao vivo.
+  if (fim - v.currentTime > 6) v.currentTime = fim - 1.2;
+  else if (fim - v.currentTime > 2.5) v.playbackRate = 1.05;
+  else v.playbackRate = 1;
+  if (v.currentTime - b.start(0) > 30){
+    try{ sb.remove(b.start(0), v.currentTime - 12); }catch(e){}
+  }
+}, 3000);
+
+v.addEventListener("error", () => { if (ativo) aviso("Erro no video"); });
+
+// Conta para o painel que tem alguem assistindo de verdade.
+setInterval(() => {
+  let buf = 0;
+  try{
+    const b = v.buffered;
+    if (b.length) buf = b.end(b.length - 1) - v.currentTime;
+  }catch(e){}
+  fetch("/sinal?t=" + T, {method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({tocando: !v.paused && v.readyState >= 3, buffer: buf})
+  }).catch(()=>{});
+}, 4000);
+
+// ------------------------------------------------------------------- o chat
+
+function adicionar(m){
+  const el = document.createElement("div");
+  const b = document.createElement("b");
+  b.textContent = m.nome;
+  el.appendChild(b);
+  el.appendChild(document.createTextNode(m.texto));
+  document.getElementById("lista").appendChild(el);
+  // Some sozinha quando a vida dela acaba do lado do servidor.
+  setTimeout(() => { el.className = "saindo";
+    setTimeout(() => el.remove(), 800); }, Math.max(1, m.resta) * 1000);
+}
+
+function puxarChat(){
+  fetch("/chat?t=" + T + "&desde=" + ultimoChat)
+    .then(r => r.json())
+    .then(d => { ultimoChat = d.ultimo; (d.mensagens || []).forEach(adicionar); })
+    .catch(()=>{});
+}
+
+function mandar(){
+  const campo = document.getElementById("texto");
+  const texto = campo.value.trim();
+  if (!texto) return;
+  const nome = document.getElementById("nome").value.trim() || "convidado";
+  localStorage.setItem("tp_apelido", nome);
+  fetch("/chat?t=" + T, {method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({nome: nome, texto: texto})
+  }).then(r => r.json()).then(d => {
+    if (d.ok){ campo.value = ""; puxarChat(); }
+    else aviso(d.erro);
+  }).catch(()=>{});
+}
+
+document.getElementById("texto").addEventListener("keydown", ev => {
+  if (ev.key === "Enter") mandar();
+});
+document.getElementById("nome").value = localStorage.getItem("tp_apelido") || "";
+
+setInterval(puxarChat, 2000);
+atualizarBotao();
+conectar();
+</script>
+"""
+
+
+# ==================================================================== servidor
+
+class Manipulador(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "tela-publica/" + VERSAO
+
+    def __init__(self, *a, ctx=None, publico=False, **kw):
+        self.ctx = ctx
+        self.publico = publico
+        super().__init__(*a, **kw)
+
+    def log_message(self, *a):
+        pass          # o registro do programa nunca guarda o que trafega aqui
+
+    # ------------------------------------------------------------------ ajuda
+
+    def _quem(self):
+        """Endereco de quem pediu. Atras do tunel todo mundo chega como
+        127.0.0.1, entao vale o cabecalho que o Cloudflare repassa."""
+        for cab in ("CF-Connecting-IP", "X-Forwarded-For"):
+            valor = self.headers.get(cab)
+            if valor:
+                return valor.split(",")[0].strip()[:45]
+        return self.client_address[0]
+
+    def _rota(self):
+        p = urllib.parse.urlparse(self.path)
+        return p.path, urllib.parse.parse_qs(p.query)
+
+    def _corpo(self):
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            if not n or n > 8192:
+                return {}
+            return json.loads(self.rfile.read(n) or b"{}")
+        except Exception:
+            return {}
+
+    def _envia(self, dados, tipo="application/json; charset=utf-8", codigo=200):
+        if isinstance(dados, str):
+            dados = dados.encode("utf-8")
+        self.send_response(codigo)
+        self.send_header("Content-Type", tipo)
+        self.send_header("Content-Length", str(len(dados)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        try:
+            self.wfile.write(dados)
+        except Exception:
+            pass
+
+    def _json(self, obj, codigo=200):
+        self._envia(json.dumps(obj), codigo=codigo)
+
+    def do_GET(self):
+        self._servir()
+
+    def do_POST(self):
+        self._servir()
+
+    # ------------------------------------------------------- painel (so local)
+
+    def _servir(self):
+        rota, q = self._rota()
+        ctx = self.ctx
+        if self.publico:
+            return self._lado_publico(rota, q)
+
+        if q.get("k", [""])[0] != ctx.chave_painel and rota != "/":
+            return self._json({"erro": "chave invalida"}, 403)
+
+        if rota == "/":
+            if q.get("k", [""])[0] != ctx.chave_painel:
+                return self._envia("Abra pelo atalho Tela publica.", "text/plain", 403)
+            ctx.viu_painel = True
+            ctx.ultimo_ping = time.time()
+            ctx.cancelar_saida()
+            dados = {"chave": ctx.chave_painel, "opcoes": ctx.captura.opcoes}
+            return self._envia(PAGINA_PAINEL.replace("__DADOS__", json.dumps(dados)),
+                               "text/html; charset=utf-8")
+
+        if rota == "/api/fontes":
+            return self._json({"janelas": listar_janelas(), "telas": listar_telas(),
+                               "microfones": listar_microfones()})
+
+        if rota == "/api/estado":
+            return self._json(self._estado_completo())
+
+        if rota == "/api/opcoes":
+            ctx.captura.aplicar(self._corpo())
+            ctx.salvar()
+            return self._json(self._estado_completo())
+
+        if rota == "/api/microfone":
+            corpo = self._corpo()
+            ctx.captura.ajustar_microfone(corpo.get("microfone", ""),
+                                          corpo.get("mic_ligado", False))
+            ctx.salvar()
+            return self._json(self._estado_completo())
+
+        if rota == "/api/iniciar":
+            ctx.captura.aplicar(self._corpo())
+            ctx.captura.iniciar()
+            ctx.salvar()
+            if ctx.tunel.disponivel and not ctx.tunel.url:
+                ctx.tunel.iniciar(ctx.porta_publica)
+            return self._json(self._estado_completo())
+
+        if rota == "/api/parar":
+            ctx.captura.parar()
+            return self._json(self._estado_completo())
+
+        if rota == "/api/tunel":
+            ctx.tunel.iniciar(ctx.porta_publica)
+            return self._json(self._estado_completo())
+
+        if rota == "/api/chat":
+            if self.command == "POST":
+                corpo = self._corpo()
+                ok, erro, espera = ctx.chat.enviar("painel", corpo.get("nome"),
+                                                   corpo.get("texto"))
+                return self._json({"ok": ok, "erro": erro, "espera": espera})
+            desde = int((q.get("desde", ["0"])[0] or "0").isdigit() and
+                        q.get("desde", ["0"])[0] or 0)
+            return self._json(ctx.chat.recentes(desde))
+
+        if rota == "/api/ping":
+            ctx.viu_painel = True
+            ctx.ultimo_ping = time.time()
+            ctx.cancelar_saida()
+            return self._json({"ok": True})
+
+        if rota == "/api/encerrar":
+            self._json({"ok": True})
+            if q.get("agora", [""])[0] == "1":
+                ctx.encerrar()
+            else:
+                ctx.agendar_saida()
+            return
+
+        return self._json({"erro": "rota desconhecida"}, 404)
+
+    def _estado_completo(self):
+        ctx = self.ctx
+        e = ctx.captura.estado_atual()
+        agora = time.time()
+        e.update({
+            "url_publica": ctx.url_publica(),
+            "urls_diretas": ctx.urls_diretas(),
+            "tunel": ctx.tunel.estado,
+            "tunel_disponivel": ctx.tunel.disponivel,
+            "visores": [v for v in ctx.visores.values() if agora - v["quando"] < 15],
+            "adaptacao": ctx.adaptador.diagnostico(),
+            "saude": ctx.saude(),
+            "problemas": ctx.problemas,
+        })
+        return e
+
+    # ------------------------------------------------------- lado de quem ve
+
+    def _lado_publico(self, rota, q):
+        ctx = self.ctx
+        token = rota[3:] if rota.startswith("/v/") else q.get("t", [""])[0]
+        try:
+            valido = secrets.compare_digest(token, ctx.token)
+        except TypeError:
+            valido = False
+        if not valido:
+            return self._envia("Link invalido.", "text/plain", 403)
+
+        if rota.startswith("/v/"):
+            return self._envia(PAGINA_VISOR, "text/html; charset=utf-8")
+
+        if rota == "/stream":
+            return self._fluxo()
+
+        if rota == "/chat":
+            if self.command == "POST":
+                corpo = self._corpo()
+                ok, erro, espera = ctx.chat.enviar(self._quem(), corpo.get("nome"),
+                                                   corpo.get("texto"))
+                return self._json({"ok": ok, "erro": erro, "espera": espera})
+            bruto = q.get("desde", ["0"])[0]
+            return self._json(ctx.chat.recentes(int(bruto) if bruto.isdigit() else 0))
+
+        if rota == "/sinal":
+            info = self._corpo()
+            agora = time.time()
+            chave = self._quem()
+            antes = ctx.visores.get(chave) or {}
+            ctx.visores[chave] = {
+                "tocando": bool(info.get("tocando")),
+                "buffer": round(float(info.get("buffer") or 0), 1),
+                "quando": agora,
+                "desde": antes.get("desde", agora),
+            }
+            return self._json({"ok": True})
+
+        return self._envia("Nao encontrado.", "text/plain", 404)
+
+    def _fluxo(self):
+        assinante, inicial, mime = self.ctx.captura.assinar()
+        if not assinante:
+            return self._envia("Transmissao parada.", "text/plain", 404)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("X-Mime", mime)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            self._pedaco(inicial)
+            while True:
+                try:
+                    dados = assinante.fila.get(timeout=20)
+                except queue.Empty:
+                    break
+                if dados is None:
+                    break
+                self._pedaco(dados)
+            self._pedaco(b"")
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            self.ctx.captura.desassinar(assinante)
+
+    def _pedaco(self, dados):
+        self.wfile.write(b"%X\r\n" % len(dados))
+        if dados:
+            self.wfile.write(dados)
+        self.wfile.write(b"\r\n")
+        self.wfile.flush()
+
+
+class Servidor(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, sock, handler):
+        self.socket = sock
+        self.server_address = sock.getsockname()
+        socketserver.BaseServer.__init__(self, self.server_address, handler)
+        self.socket.listen(64)
+
+    def handle_error(self, request, client_address):
+        pass
+
+
+# ========================================================================= main
+
+def instalar_cloudflared():
+    import urllib.request
+    destino = os.path.expanduser("~/.local/bin/cloudflared")
+    url = ("https://github.com/cloudflare/cloudflared/releases/latest/"
+           "download/cloudflared-linux-amd64")
+    print("Isto vai baixar o cloudflared, da Cloudflare, que cria o link publico.")
+    print("  origem:  " + url)
+    print("  destino: " + destino)
+    if input("Continuar? [s/N] ").strip().lower() not in ("s", "sim", "y"):
+        return 1
+    os.makedirs(os.path.dirname(destino), exist_ok=True)
+    urllib.request.urlretrieve(url, destino + ".tmp")
+    os.chmod(destino + ".tmp", 0o755)
+    os.replace(destino + ".tmp", destino)
+    print("Pronto:")
+    subprocess.run([destino, "--version"])
+    return 0
+
+
+def abrir_navegador(url):
+    for nome in ("google-chrome", "google-chrome-stable", "chromium",
+                 "chromium-browser", "firefox"):
+        caminho = shutil.which(nome)
+        if caminho:
+            args = [caminho, "--app=" + url, "--window-size=920,980"] \
+                if "chrom" in nome else [caminho, url]
+            subprocess.Popen(args, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+            return True
+    subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+    return False
+
+
+def vigia_painel(ctx):
+    while True:
+        time.sleep(20)
+        if ctx.viu_painel and time.time() - ctx.ultimo_ping > LIMITE_SEM_PING:
+            log("painel sumiu, encerrando")
+            ctx.encerrar()
+            return
+
+
+def main():
+    args = sys.argv[1:]
+    if "--instalar-cloudflared" in args:
+        return instalar_cloudflared()
+    if {"--ajuda", "-h", "--help"} & set(args):
+        print(__doc__)
+        print("Opcoes:")
+        print("  --sem-navegador          nao abre o navegador sozinho")
+        print("  --sem-tunel              nao cria o link publico")
+        print("  --porta N                porta preferida para quem assiste")
+        print("  --instalar-cloudflared   baixa o cloudflared para ~/.local/bin")
+        return 0
+
+    os.makedirs(DIR_CACHE, exist_ok=True)
+    if not sys.stdout.isatty():
+        sys.stdout = sys.stderr = open(ARQ_LOG, "a", buffering=1)
+    else:
+        print(MARCA)
+
+    problemas = verificar_ambiente()
+    for p in problemas:
+        log("ATENCAO:", p["texto"], "->", p["solucao"])
+    if any(p["grave"] for p in problemas):
+        log("Corrija os pontos acima e abra de novo.")
+
+    preferida = PORTA_PREFERIDA
+    if "--porta" in args:
+        try:
+            preferida = int(args[args.index("--porta") + 1])
+        except Exception:
+            pass
+
+    ctx = Contexto()
+    sock_pub = porta_livre("0.0.0.0", preferida)
+    sock_pai = porta_livre("127.0.0.1", 0)
+    ctx.porta_publica = sock_pub.getsockname()[1]
+    ctx.porta_painel = sock_pai.getsockname()[1]
+
+    threading.Thread(target=Servidor(
+        sock_pub, partial(Manipulador, ctx=ctx, publico=True)).serve_forever,
+        daemon=True).start()
+    threading.Thread(target=Servidor(
+        sock_pai, partial(Manipulador, ctx=ctx, publico=False)).serve_forever,
+        daemon=True).start()
+
+    log("tela-publica", VERSAO, "| publica", ctx.porta_publica,
+        "| painel", ctx.porta_painel)
+
+    if "--sem-tunel" not in args and ctx.tunel.disponivel:
+        ctx.tunel.iniciar(ctx.porta_publica)
+
+    atexit.register(ctx.encerrar)
+    for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(s, lambda *_: ctx.encerrar())
+        except Exception:
+            pass
+
+    url_painel = "http://127.0.0.1:%d/?k=%s" % (ctx.porta_painel, ctx.chave_painel)
+    log("painel:", url_painel)
+    if "--sem-navegador" not in args:
+        abrir_navegador(url_painel)
+
+    threading.Thread(target=vigia_painel, args=(ctx,), daemon=True).start()
+    while not ctx.encerrando:
+        time.sleep(0.5)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

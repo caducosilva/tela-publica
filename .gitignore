@@ -1,0 +1,38 @@
+# Cache e configuração local
+~/.cache/tela-publica/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+.tox/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Sistema
+.DS_Store
+Thumbs.db
+
+# Segredos (nunca commitar)
+*.env
+*.key
+*.pem
+*.jks
+*.keystore
+keystore.properties
+local.properties
+
+# cloudflared binary (baixado pelo --instalar-cloudflared)
+~/.local/bin/cloudflared
