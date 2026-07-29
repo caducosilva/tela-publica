@@ -1670,10 +1670,11 @@ const $ = i => document.getElementById(i);
 let est = {}, alvo = "", assinaturas = {}, ultimoChat = 0;
 
 function api(rota, corpo){
-  return fetch(rota + "?k=" + D.chave, {
-    method: corpo ? "POST" : "GET",
+  const sep = rota.indexOf("?") >= 0 ? "&" : "?";
+  return fetch(rota + sep + "k=" + encodeURIComponent(D.chave), {
+    method: "POST",
     headers: {"Content-Type":"application/json"},
-    body: corpo ? JSON.stringify(corpo) : undefined
+    body: JSON.stringify(corpo === undefined ? {} : corpo)
   }).then(r => r.json());
 }
 
@@ -1684,7 +1685,12 @@ function ocupado(btn, promessa){
 }
 
 function listar(){
-  return api("/api/fontes").then(d => {
+  return api("/api/fontes", {}).then(d => {
+    if (!d || !Array.isArray(d.telas) || !Array.isArray(d.janelas)){
+      const jn = $("jn");
+      if (jn) jn.innerHTML = "<div>Nao consegui listar as janelas. Recarregue a pagina.</div>";
+      return;
+    }
     const itens = [];
     d.telas.forEach(t => itens.push({v:"tela:"+t.nome,
       t:"Tela inteira (" + (t.rotulo || t.nome) + ")", s:t.w + "x" + t.h}));
@@ -1712,22 +1718,26 @@ function listar(){
       });
       if (!itens.length) jn.innerHTML = "<div>Nenhuma janela aberta</div>";
     }
-    const assinaM = JSON.stringify(d.microfones);
+    const assinaM = JSON.stringify(d.microfones || []);
     if (assinaturas.mic !== assinaM){
       assinaturas.mic = assinaM;
       const f = $("mic"); const antes = f.value || D.opcoes.microfone;
       f.innerHTML = "";
-      if (!d.microfones.length){
+      if (!(d.microfones || []).length){
         const o = document.createElement("option");
         o.value = ""; o.textContent = "nenhum microfone encontrado";
         f.appendChild(o);
       }
-      d.microfones.forEach(m => {
+      (d.microfones || []).forEach(m => {
         const o = document.createElement("option");
         o.value = m.nome; o.textContent = m.rotulo; f.appendChild(o);
       });
       if ([...f.options].some(o => o.value === antes)) f.value = antes;
     }
+  }).catch(() => {
+    const jn = $("jn");
+    if (jn && !jn.children.length)
+      jn.innerHTML = "<div>Falha ao carregar a lista. Recarregue a pagina.</div>";
   });
 }
 
@@ -1873,7 +1883,7 @@ function pintar(e){
                           : "Microfone desligado";
 
   $("erro").textContent = est.erro || "";
-  $("reg").textContent = (est.registro || []).join("\n");
+  $("reg").textContent = (est.registro || []).join(String.fromCharCode(10));
 }
 
 function adicionar(m){
