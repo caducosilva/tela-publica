@@ -1575,7 +1575,7 @@ transition:background .2s}
 .cx{background:var(--cx);border:1px solid var(--bd);border-radius:12px;
 padding:16px;margin-bottom:14px}
 .lin{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-.jn{max-height:230px;overflow:auto;border:1px solid var(--bd);border-radius:9px}
+.jn{max-height:320px;min-height:120px;overflow:auto;border:1px solid var(--bd);border-radius:9px}
 .jn div{padding:12px;cursor:pointer;border-bottom:1px solid var(--bd);
 display:flex;justify-content:space-between;gap:10px;align-items:center;
 transition:background .12s}
@@ -1612,11 +1612,13 @@ padding:7px 11px;font-size:14.5px;animation:ap .2s ease}
 
   <div id="problemas"></div>
 
-  <div class="cx">
-    <h2>O que transmitir</h2>
-    <div class="jn" id="jn"></div>
-    <div class="mut" style="margin-top:10px">A lista se atualiza sozinha. Clique
-      na janela ou tela que quer mostrar e ela troca na hora.</div>
+    <div class="cx">
+    <h2>O que transmitir <span class="mut" id="contagem"></span></h2>
+    <div class="jn" id="jn"><div>Carregando janelas...</div></div>
+    <div class="lin" style="margin-top:10px">
+      <button type="button" id="btn-atualizar" onclick="listar(true)">Atualizar lista</button>
+      <span class="mut">Clique na janela ou tela que quer mostrar.</span>
+    </div>
   </div>
 
   <div class="cx">
@@ -1684,20 +1686,22 @@ function ocupado(btn, promessa){
   return promessa.finally(() => { btn.disabled = false; });
 }
 
-function listar(){
+function listar(forcar){
   return api("/api/fontes", {}).then(d => {
     if (!d || !Array.isArray(d.telas) || !Array.isArray(d.janelas)){
       const jn = $("jn");
-      if (jn) jn.innerHTML = "<div>Nao consegui listar as janelas. Recarregue a pagina.</div>";
+      if (jn) jn.innerHTML = "<div>Nao consegui listar as janelas. Clique em Atualizar lista.</div>";
       return;
     }
     const itens = [];
     d.telas.forEach(t => itens.push({v:"tela:"+t.nome,
       t:"Tela inteira (" + (t.rotulo || t.nome) + ")", s:t.w + "x" + t.h}));
     d.janelas.forEach(j => itens.push({v:"janela:"+j.id, t:j.titulo || j.app,
-      s:(j.minimizada ? "minimizada  " : "") + j.app, min:j.minimizada}));
+      s:(j.minimizada ? "minimizada  " : "") + (j.w + "x" + j.h), min:j.minimizada}));
+    const cont = $("contagem");
+    if (cont) cont.textContent = "(" + d.janelas.length + " janelas)";
     const assina = JSON.stringify(itens) + "|" + alvo;
-    if (assinaturas.jn !== assina){
+    if (forcar || assinaturas.jn !== assina){
       assinaturas.jn = assina;
       const jn = $("jn"); jn.innerHTML = "";
       itens.forEach(it => {
@@ -1719,7 +1723,7 @@ function listar(){
       if (!itens.length) jn.innerHTML = "<div>Nenhuma janela aberta</div>";
     }
     const assinaM = JSON.stringify(d.microfones || []);
-    if (assinaturas.mic !== assinaM){
+    if (forcar || assinaturas.mic !== assinaM){
       assinaturas.mic = assinaM;
       const f = $("mic"); const antes = f.value || D.opcoes.microfone;
       f.innerHTML = "";
@@ -1736,8 +1740,7 @@ function listar(){
     }
   }).catch(() => {
     const jn = $("jn");
-    if (jn && !jn.children.length)
-      jn.innerHTML = "<div>Falha ao carregar a lista. Recarregue a pagina.</div>";
+    if (jn) jn.innerHTML = "<div>Falha ao carregar a lista. Clique em Atualizar lista.</div>";
   });
 }
 
@@ -1922,14 +1925,14 @@ $("texto").addEventListener("keydown", ev => {
 });
 $("apelido").value = localStorage.getItem("tp_apelido") || "";
 
-listar();
-api("/api/estado").then(pintar);
-setInterval(() => api("/api/estado").then(pintar), 2000);
-setInterval(listar, 10000);
+listar(true);
+api("/api/estado", {}).then(pintar);
+setInterval(() => api("/api/estado", {}).then(pintar), 2000);
+setInterval(() => listar(false), 10000);
 setInterval(puxarChat, 2000);
 setInterval(() => api("/api/ping", {}), 5000);
-window.addEventListener("pagehide", () =>
-  navigator.sendBeacon("/api/encerrar?k=" + D.chave));
+// Nao mata o servidor ao trocar de aba (pagehide no Chrome dispara demais).
+// Use o botao Encerrar, ou feche a janela do terminal/atalho.
 </script>
 """
 
@@ -2213,11 +2216,22 @@ class Manipulador(http.server.BaseHTTPRequestHandler):
         return p.path, urllib.parse.parse_qs(p.query)
 
     def _corpo(self):
+        """Le e descarta o body. Sempre consome Content-Length (senao o proximo
+        request na mesma conexao HTTP/1.1 nasce corrompido, ex.: '{}POST')."""
         try:
             n = int(self.headers.get("Content-Length") or 0)
-            if not n or n > 8192:
-                return {}
-            return json.loads(self.rfile.read(n) or b"{}")
+        except Exception:
+            n = 0
+        if n <= 0:
+            return {}
+        try:
+            bruto = self.rfile.read(n)
+        except Exception:
+            return {}
+        if n > 8192:
+            return {}
+        try:
+            return json.loads(bruto or b"{}")
         except Exception:
             return {}
 
@@ -2228,6 +2242,7 @@ class Manipulador(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", tipo)
         self.send_header("Content-Length", str(len(dados)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Pragma", "no-cache")
         self.end_headers()
         try:
             self.wfile.write(dados)
@@ -2235,7 +2250,7 @@ class Manipulador(http.server.BaseHTTPRequestHandler):
             pass
 
     def _json(self, obj, codigo=200):
-        self._envia(json.dumps(obj), codigo=codigo)
+        self._envia(json.dumps(obj, ensure_ascii=False), codigo=codigo)
 
     def do_GET(self):
         self._servir()
@@ -2244,10 +2259,12 @@ class Manipulador(http.server.BaseHTTPRequestHandler):
         self._servir()
 
     def _servir(self):
+        # Consome o body ANTES de qualquer resposta/atalho.
+        corpo = self._corpo() if self.command == "POST" else {}
         rota, q = self._rota()
         ctx = self.ctx
         if self.publico:
-            return self._lado_publico(rota, q)
+            return self._lado_publico(rota, q, corpo)
 
         if q.get("k", [""])[0] != ctx.chave_painel and rota != "/":
             return self._json({"erro": "chave invalida"}, 403)
@@ -2259,7 +2276,7 @@ class Manipulador(http.server.BaseHTTPRequestHandler):
             ctx.ultimo_ping = time.time()
             ctx.cancelar_saida()
             dados = {"chave": ctx.chave_painel, "opcoes": ctx.captura.opcoes}
-            return self._envia(PAGINA_PAINEL.replace("__DADOS__", json.dumps(dados)),
+            return self._envia(PAGINA_PAINEL.replace("__DADOS__", json.dumps(dados, ensure_ascii=False)),
                                "text/html; charset=utf-8")
 
         if rota == "/api/fontes":
@@ -2270,19 +2287,18 @@ class Manipulador(http.server.BaseHTTPRequestHandler):
             return self._json(self._estado_completo())
 
         if rota == "/api/opcoes":
-            ctx.captura.aplicar(self._corpo())
+            ctx.captura.aplicar(corpo)
             ctx.salvar()
             return self._json(self._estado_completo())
 
         if rota == "/api/microfone":
-            corpo = self._corpo()
             ctx.captura.ajustar_microfone(corpo.get("microfone", ""),
                                           corpo.get("mic_ligado", False))
             ctx.salvar()
             return self._json(self._estado_completo())
 
         if rota == "/api/iniciar":
-            ctx.captura.aplicar(self._corpo())
+            ctx.captura.aplicar(corpo)
             ctx.captura.iniciar()
             ctx.salvar()
             if ctx.tunel.disponivel and not ctx.tunel.url:
@@ -2298,8 +2314,7 @@ class Manipulador(http.server.BaseHTTPRequestHandler):
             return self._json(self._estado_completo())
 
         if rota == "/api/chat":
-            if self.command == "POST":
-                corpo = self._corpo()
+            if self.command == "POST" and (corpo.get("texto") is not None or corpo.get("nome") is not None):
                 ok, erro, espera = ctx.chat.enviar("painel", corpo.get("nome"),
                                                    corpo.get("texto"))
                 return self._json({"ok": ok, "erro": erro, "espera": espera})
@@ -2339,8 +2354,10 @@ class Manipulador(http.server.BaseHTTPRequestHandler):
         })
         return e
 
-    def _lado_publico(self, rota, q):
+    def _lado_publico(self, rota, q, corpo=None):
         ctx = self.ctx
+        if corpo is None:
+            corpo = {}
         token = rota[3:] if rota.startswith("/v/") else q.get("t", [""])[0]
         try:
             valido = secrets.compare_digest(token, ctx.token)
@@ -2356,8 +2373,7 @@ class Manipulador(http.server.BaseHTTPRequestHandler):
             return self._fluxo()
 
         if rota == "/chat":
-            if self.command == "POST":
-                corpo = self._corpo()
+            if self.command == "POST" and (corpo.get("texto") is not None or corpo.get("nome") is not None):
                 ok, erro, espera = ctx.chat.enviar(self._quem(), corpo.get("nome"),
                                                    corpo.get("texto"))
                 return self._json({"ok": ok, "erro": erro, "espera": espera})
@@ -2365,7 +2381,7 @@ class Manipulador(http.server.BaseHTTPRequestHandler):
             return self._json(ctx.chat.recentes(int(bruto) if bruto.isdigit() else 0))
 
         if rota == "/sinal":
-            info = self._corpo()
+            info = corpo
             agora = time.time()
             chave = self._quem()
             antes = ctx.visores.get(chave) or {}
