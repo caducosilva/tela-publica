@@ -170,10 +170,57 @@ def titulo_janela(jid):
         return ""
 
 
+def geometria_janela(jid):
+    """Retorna x,y,w,h da janela no Windows, ja ajustado pro gdigrab."""
+    if not IS_WINDOWS:
+        return None
+    try:
+        hwnd = int(str(jid), 0)
+        user32 = ctypes.windll.user32
+        try:
+            user32.SetProcessDPIAware()
+        except Exception:
+            pass
+        if not user32.IsWindow(hwnd) or user32.IsIconic(hwnd):
+            return None
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return None
+        x, y = int(rect.left), int(rect.top)
+        w, h = int(rect.right - rect.left), int(rect.bottom - rect.top)
+
+        # Area virtual do desktop (gdigrab usa esse sistema de coordenadas)
+        vx = int(user32.GetSystemMetrics(76))  # SM_XVIRTUALSCREEN
+        vy = int(user32.GetSystemMetrics(77))  # SM_YVIRTUALSCREEN
+        vw = int(user32.GetSystemMetrics(78) or user32.GetSystemMetrics(0))
+        vh = int(user32.GetSystemMetrics(79) or user32.GetSystemMetrics(1))
+
+        # Janela maximizada no Win10/11 vem com borda negativa (-7/-8).
+        if x < vx:
+            w -= (vx - x)
+            x = vx
+        if y < vy:
+            h -= (vy - y)
+            y = vy
+        if x + w > vx + vw:
+            w = vx + vw - x
+        if y + h > vy + vh:
+            h = vy + vh - y
+
+        # gdigrab exige largura/altura pares e positivas
+        w -= w % 2
+        h -= h % 2
+        if w < 16 or h < 16:
+            return None
+        return {"x": x, "y": y, "w": w, "h": h}
+    except Exception:
+        return None
+
+
 def estado_janela(jid):
     if IS_WINDOWS:
         try:
-            hwnd = int(jid)
+            hwnd = int(str(jid), 0)
             user32 = ctypes.windll.user32
             if not user32.IsWindow(hwnd):
                 return "sumiu"
@@ -194,11 +241,18 @@ def janela_visivel(jid):
 def restaurar_janela(jid):
     if IS_WINDOWS:
         try:
-            hwnd = int(jid)
+            hwnd = int(str(jid), 0)
             user32 = ctypes.windll.user32
-            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            if not user32.IsWindow(hwnd):
+                return False
+            # SW_RESTORE=9; se so estiver atras, traz pra frente
+            if user32.IsIconic(hwnd):
+                user32.ShowWindow(hwnd, 9)
+            else:
+                user32.ShowWindow(hwnd, 5)  # SW_SHOW
+            user32.BringWindowToTop(hwnd)
             user32.SetForegroundWindow(hwnd)
-            time.sleep(0.5)
+            time.sleep(0.4)
             return janela_visivel(jid)
         except Exception:
             return False
@@ -252,6 +306,8 @@ def listar_janelas():
                     "titulo": title,
                     "app": (cls.value or title)[:30],
                     "classe": cls.value or title,
+                    "x": int(rect.left),
+                    "y": int(rect.top),
                     "w": int(w),
                     "h": int(h),
                     "minimizada": bool(user32.IsIconic(hwnd)),
@@ -384,13 +440,13 @@ def _probe_encoder(codec, extras=()):
     """Tenta codificar 1 frame; evita escolher encoder so listado (ex.: nvenc sem CUDA)."""
     cmd = [
         FFMPEG_BIN, "-hide_banner", "-loglevel", "error",
-        "-f", "lavfi", "-i", "color=c=black:s=320x180:d=0.2",
+        "-f", "lavfi", "-i", "color=c=black:s=320x180:d=0.1",
         "-frames:v", "1", "-c:v", codec,
     ]
     cmd += list(extras)
     cmd += ["-f", "null", "-"]
     try:
-        kwargs = dict(capture_output=True, text=True, timeout=20)
+        kwargs = dict(capture_output=True, text=True, timeout=6)
         if IS_WINDOWS:
             kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         r = subprocess.run(cmd, **kwargs)
@@ -813,7 +869,7 @@ class Captura:
             mic, ligado = self.opcoes["microfone"], self.opcoes["mic_ligado"]
         tipo, _, ref = alvo.partition(":")
         if tipo == "janela":
-            janela = next((j for j in listar_janelas() if j["id"] == ref), None)
+            janela = next((j for j in listar_janelas() if str(j["id"]) == str(ref)), None)
             if janela:
                 self.mesa.definir_janela(janela["pid"], [janela["classe"], janela["app"]])
             else:
@@ -885,17 +941,27 @@ class Captura:
 
         if IS_WINDOWS:
             if tipo == "janela":
-                janela = next((j for j in listar_janelas() if j["id"] == ref), None)
-                titulo = (janela["titulo"] if janela else "") or titulo_janela(ref)
-                if not titulo:
-                    # Fallback: captura a area da tela primaria
+                # No Windows, title= do gdigrab e fragil (titulo muda, acentos,
+                # maximizada). Capturamos a regiao da janela no desktop.
+                geo = geometria_janela(ref)
+                if geo:
                     cmd += ["-f", "gdigrab", "-framerate", str(n["fps"]),
+                            "-offset_x", str(geo["x"]), "-offset_y", str(geo["y"]),
+                            "-video_size", "%dx%d" % (geo["w"], geo["h"]),
                             "-thread_queue_size", "1024", "-draw_mouse", "0",
                             "-i", "desktop"]
                 else:
-                    cmd += ["-f", "gdigrab", "-framerate", str(n["fps"]),
-                            "-thread_queue_size", "1024", "-draw_mouse", "0",
-                            "-i", "title=%s" % titulo]
+                    janela = next((j for j in listar_janelas()
+                                   if str(j["id"]) == str(ref)), None)
+                    titulo = (janela["titulo"] if janela else "") or titulo_janela(ref)
+                    if titulo:
+                        cmd += ["-f", "gdigrab", "-framerate", str(n["fps"]),
+                                "-thread_queue_size", "1024", "-draw_mouse", "0",
+                                "-i", "title=%s" % titulo]
+                    else:
+                        cmd += ["-f", "gdigrab", "-framerate", str(n["fps"]),
+                                "-thread_queue_size", "1024", "-draw_mouse", "0",
+                                "-i", "desktop"]
             else:
                 tela = next((t for t in listar_telas() if t["nome"] == ref), None) \
                     or (listar_telas()[0] if listar_telas() else None)
@@ -1177,13 +1243,15 @@ class Captura:
                 self.bytes_janela = 0
 
     def _vigia_janela(self):
+        geo_cache = None
         while True:
-            time.sleep(3)
+            time.sleep(2)
             try:
                 with self.trava:
                     tipo, _, ref = self.opcoes["alvo"].partition(":")
                     rodando, pausado = self.deve_rodar, self.pausado_por_janela
                 if tipo != "janela" or not (rodando or pausado):
+                    geo_cache = None
                     continue
                 situacao = estado_janela(ref)
                 with self.trava:
@@ -1192,6 +1260,7 @@ class Captura:
                         self.deve_rodar = True
                         self.erro = ""
                         self.falhas = 0
+                        geo_cache = None
                         log("janela voltou, retomando")
                         self._parar_processo()
                         self._iniciar_processo()
@@ -1199,6 +1268,7 @@ class Captura:
                         self.pausado_por_janela = True
                         self.deve_rodar = False
                         self._parar_processo()
+                        geo_cache = None
                         if situacao == "sumiu":
                             self.estado = "janela fechada"
                             self.erro = "Essa janela foi fechada. Escolha outra na lista."
@@ -1206,7 +1276,18 @@ class Captura:
                         else:
                             self.estado = "janela minimizada"
                             self.erro = ("A janela saiu da tela. Restaure ela e a "
-                                         "transmissão volta sozinha.")
+                                         "transmissao volta sozinha.")
+                    elif situacao == "visivel" and rodando and IS_WINDOWS:
+                        # Se a janela moveu/redimensionou, reinicia a captura
+                        # na nova regiao (no Linux o x11grab usa window_id).
+                        geo = geometria_janela(ref)
+                        if geo and geo_cache and geo != geo_cache:
+                            log("janela moveu, ajustando captura",
+                                "%(w)dx%(h)d+%(x)d+%(y)d" % geo)
+                            self._parar_processo()
+                            self._iniciar_processo()
+                        if geo:
+                            geo_cache = geo
             except Exception as e:
                 log("vigia da janela:", e)
 
