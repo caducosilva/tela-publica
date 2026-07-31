@@ -178,3 +178,11 @@ Titular: Carlos Eduardo, Mogi das Cruzes.
 ## Licença
 
 MIT. Veja o arquivo [LICENSE](LICENSE).
+
+## Contato
+
+Autor: Carlos Eduardo
+
+- LinkedIn: https://www.linkedin.com/in/carlos-da-silva20ba5740a
+- Instagram: https://www.instagram.com/caducosilva
+- GitHub: https://github.com/caducosilva
