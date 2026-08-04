@@ -11,7 +11,10 @@ Atualizado com suporte completo a Windows 10/11.
 
 import atexit
 import ctypes
-from ctypes import wintypes
+from ctypes import (
+    POINTER, Structure, WINFUNCTYPE, byref, c_byte, c_longlong, c_uint32,
+    c_uint64, c_ulong, c_void_p, cast, string_at, wintypes,
+)
 import http.server
 import json
 import os
@@ -20,6 +23,7 @@ import shutil
 import signal
 import socket
 import socketserver
+import struct
 import subprocess
 import sys
 import threading
@@ -31,7 +35,20 @@ import urllib.request
 from collections import deque
 from functools import partial
 
-VERSAO = "3.1"
+VERSAO = "4.7"
+
+# FPS fixo; resolucao escolhida pelo dono ou por quem assiste (480p/720p/1080p).
+SAIDA_FPS = 30
+ATRASOS_OK = (3, 6, 10)
+ATRASO_PADRAO = 6
+
+NIVEIS = [
+    {"nome": "480p", "larg": 854, "alt": 480, "fps": SAIDA_FPS, "qp": 28, "kbps": 1500},
+    {"nome": "720p", "larg": 1280, "alt": 720, "fps": SAIDA_FPS, "qp": 20, "kbps": 4500},
+    {"nome": "1080p", "larg": 1920, "alt": 1080, "fps": SAIDA_FPS, "qp": 18, "kbps": 12000},
+]
+NIVEL_PADRAO = 2  # 1080p
+
 MARCA = "tela-publica · criado por caducosilva · Windows 10/11 + Linux · contato: abobicarlo@gmail.com"
 
 IS_WINDOWS = (sys.platform == "win32")
@@ -43,8 +60,20 @@ else:
     DIR_CACHE = os.path.expanduser("~/.cache/tela-publica")
 ARQ_CONFIG = os.path.join(DIR_CACHE, "config.json")
 ARQ_LOG = os.path.join(DIR_CACHE, "tela-publica.log")
+ARQ_LOCK = os.path.join(DIR_CACHE, "tela-publica.lock")
+ARQ_PAINEL = os.path.join(DIR_CACHE, "painel.url")
 RENDER_NODE = "/dev/dri/renderD128"
 SINK_MESA = "tela_publica"
+# Ganho no audio enviado (filmes costumam sair baixo no AAC). ~9 dB.
+AUDIO_GANHO = 2.8
+HELPER_AUDIO_VER = "1"
+
+
+def _dir_script():
+    try:
+        return os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        return os.path.dirname(os.path.abspath(sys.argv[0]))
 
 
 def _achar_bin(nome, extras=()):
@@ -69,13 +98,6 @@ CLOUDFLARED_BIN = _achar_bin("cloudflared", (
 ))
 
 LIMITE_SEM_PING = 900
-
-NIVEIS = [
-    {"nome": "1080p", "larg": 1920, "alt": 1080, "fps": 30, "qp": 20, "kbps": 12000},
-    {"nome": "1080p", "larg": 1920, "alt": 1080, "fps": 30, "qp": 25, "kbps": 7000},
-    {"nome": "720p",  "larg": 1280, "alt": 720,  "fps": 30, "qp": 27, "kbps": 4000},
-    {"nome": "480p",  "larg": 854,  "alt": 480,  "fps": 30, "qp": 30, "kbps": 2000},
-]
 
 
 def log(*args):
@@ -109,16 +131,173 @@ def rodar(cmd, timeout=8):
         return ""
 
 
+def porta_em_uso(host, porta):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.settimeout(0.3)
+        return s.connect_ex((host, porta)) == 0
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
 def porta_livre(host, preferida=0):
-    for tentativa in ([preferida] if preferida else []) + [0]:
+    """Bind em porta livre: tenta a preferida, vizinhas e por fim qualquer porta do SO."""
+    tentativas = []
+    if preferida:
+        tentativas.append(preferida)
+        for offset in range(1, 80):
+            tentativas.append(preferida + offset)
+    tentativas.append(0)
+    vistos = set()
+    for tentativa in tentativas:
+        if tentativa in vistos:
+            continue
+        vistos.add(tentativa)
+        if tentativa and porta_em_uso("127.0.0.1", tentativa):
+            continue
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # Sem SO_REUSEADDR: evita duas instancias na mesma porta no Windows.
         try:
             s.bind((host, tentativa))
             return s
         except OSError:
             s.close()
     raise RuntimeError("nenhuma porta disponivel")
+
+
+_MUTEX_HANDLE = None
+_LOCK_FD = None
+
+
+def _pid_vivo(pid):
+    if not pid:
+        return False
+    try:
+        if IS_WINDOWS:
+            kernel32 = ctypes.windll.kernel32
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+            if not h:
+                return False
+            try:
+                code = wintypes.DWORD()
+                if kernel32.GetExitCodeProcess(h, ctypes.byref(code)):
+                    return int(code.value) == STILL_ACTIVE
+                return True
+            finally:
+                kernel32.CloseHandle(h)
+        os.kill(int(pid), 0)
+        return True
+    except Exception:
+        return False
+
+
+def _reabrir_painel_existente():
+    url = ""
+    try:
+        with open(ARQ_PAINEL, "r", encoding="utf-8") as f:
+            url = (f.read() or "").strip()
+    except Exception:
+        url = ""
+    log("ja tem uma instancia rodando")
+    if url:
+        log("reabrindo painel existente")
+        try:
+            abrir_navegador(url)
+        except Exception:
+            pass
+    else:
+        print("Transmitir Tela ja esta aberto. Feche o terminal anterior.")
+
+
+def garantir_instancia_unica():
+    """Impede dois Transmitir Tela ao mesmo tempo (isso quebrava a lista)."""
+    global _MUTEX_HANDLE, _LOCK_FD
+    os.makedirs(DIR_CACHE, exist_ok=True)
+
+    # 1) Mutex do Windows (atomico).
+    if IS_WINDOWS:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        kernel32.SetLastError(0)
+        handle = kernel32.CreateMutexW(None, False, "Local\\TelaPublicaTransmitirTela")
+        err = int(kernel32.GetLastError() or 0)
+        ERROR_ALREADY_EXISTS = 183
+        if handle:
+            _MUTEX_HANDLE = handle
+            if err == ERROR_ALREADY_EXISTS:
+                _reabrir_painel_existente()
+                return False
+
+    # 2) Arquivo exclusivo como segunda trava.
+    for _ in range(3):
+        try:
+            fd = os.open(ARQ_LOCK, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+            os.write(fd, str(os.getpid()).encode("ascii", "ignore"))
+            _LOCK_FD = fd
+            break
+        except FileExistsError:
+            antigo = 0
+            try:
+                with open(ARQ_LOCK, "r", encoding="utf-8") as f:
+                    antigo = int((f.read() or "0").strip() or "0")
+            except Exception:
+                antigo = 0
+            if antigo and antigo != os.getpid() and _pid_vivo(antigo):
+                _reabrir_painel_existente()
+                return False
+            try:
+                os.remove(ARQ_LOCK)
+            except Exception:
+                time.sleep(0.1)
+        except Exception:
+            break
+    else:
+        # nao conseguiu criar lock exclusivo e nao confirmou dono vivo
+        if os.path.exists(ARQ_LOCK):
+            _reabrir_painel_existente()
+            return False
+
+    def _limpar_lock():
+        global _MUTEX_HANDLE, _LOCK_FD
+        try:
+            if _LOCK_FD is not None:
+                try:
+                    os.close(_LOCK_FD)
+                except Exception:
+                    pass
+                _LOCK_FD = None
+            if os.path.exists(ARQ_LOCK):
+                try:
+                    with open(ARQ_LOCK, "r", encoding="utf-8") as f:
+                        dono = (f.read() or "").strip()
+                    if dono == str(os.getpid()):
+                        os.remove(ARQ_LOCK)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            if IS_WINDOWS and _MUTEX_HANDLE:
+                ctypes.windll.kernel32.CloseHandle(_MUTEX_HANDLE)
+                _MUTEX_HANDLE = None
+        except Exception:
+            pass
+
+    atexit.register(_limpar_lock)
+    return True
+
+
+def salvar_url_painel(url):
+    try:
+        with open(ARQ_PAINEL, "w", encoding="utf-8") as f:
+            f.write(url or "")
+    except Exception:
+        pass
 
 
 def ip_local():
@@ -264,13 +443,29 @@ def geometria_janela(jid):
 
 
 def estado_janela(jid):
+    """Estado da janela alvo.
+
+    "visivel" aqui significa capturavel (aberta, mesmo coberta ou sem foco).
+    Nao exige estar em primeiro plano. Alguns apps (VLC/Qt) mentem IsIconic
+    ao perder foco: se ainda tem tamanho util, trata como capturavel.
+    """
     if IS_WINDOWS:
         try:
             hwnd = int(str(jid), 0)
             user32 = ctypes.windll.user32
             if not user32.IsWindow(hwnd):
                 return "sumiu"
-            return "minimizada" if user32.IsIconic(hwnd) else "visivel"
+            rect = wintypes.RECT()
+            tem_rect = bool(user32.GetWindowRect(hwnd, ctypes.byref(rect)))
+            w = int(rect.right - rect.left) if tem_rect else 0
+            h = int(rect.bottom - rect.top) if tem_rect else 0
+            # Minimizada de verdade costuma ir para coords ~-32000.
+            offscreen = tem_rect and (rect.left <= -25000 or rect.top <= -25000)
+            if w >= 16 and h >= 16 and not offscreen:
+                return "visivel"
+            if user32.IsIconic(hwnd) or offscreen or w < 16 or h < 16:
+                return "minimizada"
+            return "visivel"
         except Exception:
             return "sumiu"
 
@@ -282,6 +477,164 @@ def estado_janela(jid):
 
 def janela_visivel(jid):
     return estado_janela(jid) == "visivel"
+
+
+def janela_ainda_existe(jid):
+    return estado_janela(jid) != "sumiu"
+
+
+class WINDOWPLACEMENT(ctypes.Structure):
+    _fields_ = [
+        ("length", wintypes.UINT),
+        ("flags", wintypes.UINT),
+        ("showCmd", wintypes.UINT),
+        ("ptMinPosition", wintypes.POINT),
+        ("ptMaxPosition", wintypes.POINT),
+        ("rcNormalPosition", wintypes.RECT),
+    ]
+
+
+def garantir_janela_capturavel(jid):
+    """Garante que a janela nao esta minimizada, sem roubar o foco.
+
+    Voce pode continuar navegando em outras janelas: a captura usa a HWND
+    alvo, nao a janela em primeiro plano.
+    """
+    if not IS_WINDOWS:
+        return janela_visivel(jid)
+    try:
+        hwnd = int(str(jid), 0)
+        user32 = ctypes.windll.user32
+        if not user32.IsWindow(hwnd):
+            return False
+        if user32.IsIconic(hwnd):
+            # Restaura sem ativar (nao tira o foco do Chrome/YouTube etc).
+            wp = WINDOWPLACEMENT()
+            wp.length = ctypes.sizeof(WINDOWPLACEMENT)
+            if user32.GetWindowPlacement(hwnd, ctypes.byref(wp)):
+                wp.showCmd = 4  # SW_SHOWNOACTIVATE
+                user32.SetWindowPlacement(hwnd, ctypes.byref(wp))
+            else:
+                user32.ShowWindow(hwnd, 4)  # SW_SHOWNOACTIVATE
+            time.sleep(0.2)
+        return bool(user32.IsWindow(hwnd)) and not bool(user32.IsIconic(hwnd))
+    except Exception:
+        return False
+
+
+class BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [
+        ("biSize", wintypes.DWORD),
+        ("biWidth", wintypes.LONG),
+        ("biHeight", wintypes.LONG),
+        ("biPlanes", wintypes.WORD),
+        ("biBitCount", wintypes.WORD),
+        ("biCompression", wintypes.DWORD),
+        ("biSizeImage", wintypes.DWORD),
+        ("biXPelsPerMeter", wintypes.LONG),
+        ("biYPelsPerMeter", wintypes.LONG),
+        ("biClrUsed", wintypes.DWORD),
+        ("biClrImportant", wintypes.DWORD),
+    ]
+
+
+class BITMAPINFO(ctypes.Structure):
+    _fields_ = [("bmiHeader", BITMAPINFOHEADER), ("bmiColors", wintypes.DWORD * 3)]
+
+
+def tamanho_janela_captura(jid):
+    """Largura/altura pares da janela para PrintWindow (GetWindowRect).
+
+    Nao usa bounds DWM: PrintWindow desenha no tamanho de GetWindowRect.
+    Se misturar os dois, o frame fica cortado ou com barra preta.
+    Ignora IsIconic mentiroso: se o rect ainda e util, captura.
+    """
+    if not IS_WINDOWS:
+        return 0, 0
+    try:
+        hwnd = int(str(jid), 0)
+        user32 = ctypes.windll.user32
+        if not user32.IsWindow(hwnd):
+            return 0, 0
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return 0, 0
+        if rect.left <= -25000 or rect.top <= -25000:
+            return 0, 0
+        w = int(rect.right - rect.left)
+        h = int(rect.bottom - rect.top)
+        w -= w % 2
+        h -= h % 2
+        if w < 16 or h < 16:
+            return 0, 0
+        return w, h
+    except Exception:
+        return 0, 0
+
+
+def capturar_hwnd_bgr(hwnd, larg, alt):
+    """Captura o conteudo real da janela (mesmo coberta / sem foco).
+
+    gdigrab por titulo/regiao so pega pixels visiveis no desktop: se o
+    YouTube estiver na frente do VLC, sai o YouTube ou preto. PrintWindow
+    com PW_RENDERFULLCONTENT le o buffer DWM da HWND alvo.
+    """
+    if not IS_WINDOWS or not hwnd or larg < 2 or alt < 2:
+        return None
+    user32 = ctypes.windll.user32
+    gdi32 = ctypes.windll.gdi32
+    hwnd = int(hwnd)
+    if not user32.IsWindow(hwnd):
+        return None
+
+    # DC da propria janela (melhor que DC da tela para apps Qt/DirectX).
+    hdc_win = user32.GetWindowDC(hwnd) or user32.GetDC(hwnd)
+    if not hdc_win:
+        return None
+    hdc_mem = gdi32.CreateCompatibleDC(hdc_win)
+    hbmp = gdi32.CreateCompatibleBitmap(hdc_win, larg, alt)
+    antigo = gdi32.SelectObject(hdc_mem, hbmp)
+    try:
+        # limpa pra nao reaproveitar lixo se PrintWindow falhar parcialmente
+        gdi32.BitBlt(hdc_mem, 0, 0, larg, alt, 0, 0, 0, 0x00000042)  # BLACKNESS
+        # 2 = PW_RENDERFULLCONTENT (janela coberta); 3 = client+full; 0 = basico
+        ok = False
+        for flag in (2, 3, 0):
+            if user32.PrintWindow(hwnd, hdc_mem, flag):
+                ok = True
+                break
+        if not ok:
+            # ultimo recurso: BitBlt do DC da janela (pode falhar se coberta)
+            gdi32.BitBlt(hdc_mem, 0, 0, larg, alt, hdc_win, 0, 0, 0x00CC0020)
+            ok = True
+        if not ok:
+            return None
+
+        bmi = BITMAPINFO()
+        ctypes.memset(ctypes.byref(bmi), 0, ctypes.sizeof(bmi))
+        bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        bmi.bmiHeader.biWidth = larg
+        bmi.bmiHeader.biHeight = -alt  # top-down
+        bmi.bmiHeader.biPlanes = 1
+        bmi.bmiHeader.biBitCount = 24
+        bmi.bmiHeader.biCompression = 0  # BI_RGB
+        stride = ((larg * 3 + 3) & ~3)
+        buf = (ctypes.c_char * (stride * alt))()
+        linhas = gdi32.GetDIBits(hdc_mem, hbmp, 0, alt, buf, ctypes.byref(bmi), 0)
+        if linhas <= 0:
+            return None
+        if stride == larg * 3:
+            return bytes(buf)
+        cru = bytearray(larg * 3 * alt)
+        for y in range(alt):
+            ini = y * stride
+            cru[y * larg * 3:(y + 1) * larg * 3] = buf[ini:ini + larg * 3]
+        return bytes(cru)
+    finally:
+        gdi32.SelectObject(hdc_mem, antigo)
+        gdi32.DeleteObject(hbmp)
+        gdi32.DeleteDC(hdc_mem)
+        user32.ReleaseDC(hwnd, hdc_win)
 
 
 def restaurar_janela(jid):
@@ -336,6 +689,27 @@ def listar_janelas():
         except Exception:
             pass
 
+        # Tipagem explicita evita HWND truncado em Python 64-bit.
+        user32.EnumWindows.restype = wintypes.BOOL
+        user32.IsWindowVisible.argtypes = [wintypes.HWND]
+        user32.IsWindowVisible.restype = wintypes.BOOL
+        user32.IsIconic.argtypes = [wintypes.HWND]
+        user32.IsIconic.restype = wintypes.BOOL
+        user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+        user32.GetWindow.restype = wintypes.HWND
+        user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.GetWindowLongW.restype = ctypes.c_long
+        user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+        user32.GetWindowTextLengthW.restype = ctypes.c_int
+        user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        user32.GetWindowTextW.restype = ctypes.c_int
+        user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        user32.GetClassNameW.restype = ctypes.c_int
+        user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+        user32.GetWindowRect.restype = wintypes.BOOL
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+
         GWL_EXSTYLE = -20
         WS_EX_TOOLWINDOW = 0x00000080
         WS_EX_APPWINDOW = 0x00040000
@@ -346,6 +720,7 @@ def listar_janelas():
             "Microsoft Text Input Application",
             "Experiencia de Introducao do Windows",
             "Experiência de Introdução do Windows",
+            "DWM Notification Window",
         )
         ignorar_classe = (
             "Windows.UI.Core.CoreWindow",
@@ -354,19 +729,20 @@ def listar_janelas():
             "Progman",
             "WorkerW",
             "NotifyIconOverflowWindow",
+            "Xaml_WindowedPopupClass",
+            "Dwm",
         )
-        ignorar_app = ("textinputhost", "applicationframehost", "systemsettings")
+        ignorar_app = ("textinputhost", "systemsettings", "dwm")
 
         @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
         def enum_windows_callback(hwnd, extra):
             try:
-                if not user32.IsWindowVisible(hwnd):
+                if not user32.IsWindowVisible(hwnd) and not user32.IsIconic(hwnd):
                     return True
                 if _janela_cloaked(hwnd):
                     return True
-                # So top-level estilo Alt+Tab (sem dono), salvo AppWindow.
                 owner = user32.GetWindow(hwnd, GW_OWNER)
-                ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+                ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE) & 0xFFFFFFFF
                 if owner and not (ex & WS_EX_APPWINDOW):
                     return True
                 if (ex & WS_EX_TOOLWINDOW) and not (ex & WS_EX_APPWINDOW):
@@ -389,9 +765,11 @@ def listar_janelas():
 
                 rect = wintypes.RECT()
                 user32.GetWindowRect(hwnd, ctypes.byref(rect))
-                w = rect.right - rect.left
-                h = rect.bottom - rect.top
-                if w < 80 or h < 80:
+                w = int(rect.right - rect.left)
+                h = int(rect.bottom - rect.top)
+                minimizada = bool(user32.IsIconic(hwnd))
+                # Minimizada no Windows pode reportar tamanho pequeno/negativo.
+                if not minimizada and (w < 50 or h < 50):
                     return True
 
                 pid = wintypes.DWORD()
@@ -401,18 +779,20 @@ def listar_janelas():
                     return True
                 if not title.strip():
                     title = app
+                if not title.strip():
+                    return True
 
                 janelas.append({
                     "id": str(int(hwnd)),
-                    "pid": int(pid.value),
-                    "titulo": title,
-                    "app": app[:40],
-                    "classe": classe or app,
+                    "pid": int(pid.value or 0),
+                    "titulo": title[:120],
+                    "app": (app or "app")[:40],
+                    "classe": classe or app or "app",
                     "x": int(rect.left),
                     "y": int(rect.top),
-                    "w": int(w),
-                    "h": int(h),
-                    "minimizada": bool(user32.IsIconic(hwnd)),
+                    "w": max(0, w),
+                    "h": max(0, h),
+                    "minimizada": minimizada,
                 })
             except Exception:
                 pass
@@ -420,8 +800,10 @@ def listar_janelas():
 
         # Mantem referencia do callback (senao o GC do Python quebra o EnumWindows).
         listar_janelas._cb = enum_windows_callback
-        user32.EnumWindows(enum_windows_callback, 0)
-        # Uma entrada por HWND; ordena app + titulo.
+        user32.EnumWindows.argtypes = [type(enum_windows_callback), wintypes.LPARAM]
+        ok = user32.EnumWindows(enum_windows_callback, 0)
+        if not ok and not janelas:
+            log("EnumWindows falhou ao listar janelas")
         janelas.sort(key=lambda j: (j["minimizada"], j["app"].lower(), j["titulo"].lower()))
         return janelas
 
@@ -483,17 +865,85 @@ def sink_padrao():
     return rodar(["pactl", "get-default-sink"]).strip()
 
 
-def _dshow_audio_devices():
+_CACHE_DSHOW = {"em": 0.0, "devs": None}
+_CACHE_MICS = {"em": 0.0, "lista": None}
+
+
+def _dshow_audio_devices(forcar=False):
+    agora = time.time()
+    if (not forcar and _CACHE_DSHOW["devs"] is not None
+            and agora - _CACHE_DSHOW["em"] < 20):
+        return list(_CACHE_DSHOW["devs"])
+
     cmd = [FFMPEG_BIN, "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"]
+    out = ""
     try:
-        kwargs = dict(capture_output=True, text=True, timeout=12)
+        kwargs = dict(capture_output=True, timeout=15)
         if IS_WINDOWS:
             kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         res = subprocess.run(cmd, **kwargs)
-        out = (res.stderr or "") + (res.stdout or "")
-    except Exception:
+        bruto = (res.stderr or b"") + (res.stdout or b"")
+        for enc in ("utf-8", "cp1252", "latin-1"):
+            try:
+                out = bruto.decode(enc)
+                break
+            except Exception:
+                continue
+        if not out:
+            out = bruto.decode("utf-8", errors="replace")
+    except Exception as e:
+        log("falha ao listar devices dshow:", e)
         out = ""
-    return re.findall(r'"([^"]+)"\s*\(audio\)', out)
+
+    # Formatos comuns do ffmpeg (ASCII e aspas “curvas”).
+    nomes = []
+    for padrao in (
+        r'"([^"]+)"\s*\(audio\)',
+        r"'([^']+)'\s*\(audio\)",
+        r'“([^”]+)”\s*\(audio\)',
+        r'"([^"]+)"\s*\(audio\s*only\)',
+    ):
+        for n in re.findall(padrao, out, flags=re.IGNORECASE):
+            n = (n or "").strip()
+            if n and n not in nomes:
+                nomes.append(n)
+
+    if nomes:
+        _CACHE_DSHOW["devs"] = nomes
+        _CACHE_DSHOW["em"] = agora
+    elif _CACHE_DSHOW["devs"]:
+        return list(_CACHE_DSHOW["devs"])
+    return list(nomes)
+
+
+def _microfones_windows_pnp():
+    """Fallback: endpoints de captura do Windows (MMDEVICE)."""
+    if not IS_WINDOWS:
+        return []
+    ps = (
+        "Get-PnpDevice -Class AudioEndpoint -Status OK -ErrorAction SilentlyContinue "
+        "| Where-Object { $_.InstanceId -match '\\{0\\.0\\.1\\.00000000\\}' } "
+        "| ForEach-Object { $_.FriendlyName }"
+    )
+    try:
+        kwargs = dict(capture_output=True, text=True, timeout=8)
+        if IS_WINDOWS:
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        res = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+            **kwargs)
+        linhas = [ln.strip() for ln in (res.stdout or "").splitlines() if ln.strip()]
+        # remove duplicatas preservando ordem
+        vistos, saida = set(), []
+        for n in linhas:
+            chave = n.lower()
+            if chave not in vistos:
+                vistos.add(chave)
+                saida.append(n)
+        return saida
+    except Exception as e:
+        log("falha ao listar mics via PnP:", e)
+        return []
 
 
 def listar_loopback_windows():
@@ -506,16 +956,477 @@ def listar_loopback_windows():
     return ""
 
 
-def listar_microfones():
-    if IS_WINDOWS:
-        mics = []
-        for name in _dshow_audio_devices():
-            baixo = name.lower()
-            if any(x in baixo for x in ("stereo mix", "what u hear", "loopback",
-                                        "wave out mix", "cable output")):
+# GUIDs reais do runtime (NAudio/Wine). A documentacao da Microsoft lista outros.
+_GUID_MMENUM = "{BCDE0395-E52F-467C-8E3D-C4579291692E}"
+_GUID_IMMENUM = "{A95664D2-9614-4F35-A746-DE8DB63617E6}"
+_GUID_IAUDIOCLIENT = "{1CB9AD4C-DBFA-4C32-B178-C2F568A703B2}"
+_GUID_IAUDIOCAPTURE = "{C8ADBD64-E71E-48A0-A4DE-185C395CD317}"
+_AUDCLNT_STREAMFLAGS_LOOPBACK = 0x00020000
+_CLSCTX_ALL = 23
+
+
+class _GUID(Structure):
+    _fields_ = [
+        ("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
+        ("Data3", wintypes.WORD), ("Data4", wintypes.BYTE * 8),
+    ]
+
+    def __init__(self, texto=None):
+        super().__init__()
+        if not texto:
+            return
+        p = texto.strip("{}").split("-")
+        self.Data1 = int(p[0], 16)
+        self.Data2 = int(p[1], 16)
+        self.Data3 = int(p[2], 16)
+        b = bytes.fromhex(p[3] + p[4])
+        for i, x in enumerate(b):
+            self.Data4[i] = x
+
+
+class _WAVEFORMATEX(Structure):
+    _fields_ = [
+        ("wFormatTag", wintypes.WORD), ("nChannels", wintypes.WORD),
+        ("nSamplesPerSec", wintypes.DWORD), ("nAvgBytesPerSec", wintypes.DWORD),
+        ("nBlockAlign", wintypes.WORD), ("wBitsPerSample", wintypes.WORD),
+        ("cbSize", wintypes.WORD),
+    ]
+
+
+def _com_vt(obj, idx, restype, *argtypes):
+    this = cast(obj, POINTER(c_void_p))
+    vt = cast(this[0], POINTER(c_void_p))
+    fn = WINFUNCTYPE(restype, c_void_p, *argtypes)(vt[idx])
+    return lambda *a: fn(this, *a)
+
+
+class WasapiLoopback:
+    """Captura o som que sai nas caixas (loopback) e manda PCM s16le via TCP."""
+
+    def __init__(self):
+        self.porta = 0
+        self.rate = 48000
+        self.channels = 2
+        self.ativo = False
+        self.erro = ""
+        self._parar = threading.Event()
+        self._pronto = threading.Event()
+        self._thread = None
+        self._srv = None
+
+    def preparar(self):
+        """Sobe WASAPI numa thread e espera o socket ficar pronto."""
+        self.parar()
+        self._parar.clear()
+        self._pronto.clear()
+        self.erro = ""
+        self._thread = threading.Thread(target=self._rodar, daemon=True)
+        self._thread.start()
+        if not self._pronto.wait(timeout=10):
+            self.parar()
+            raise RuntimeError(self.erro or "timeout ao iniciar WASAPI")
+        if self.erro or not self.porta:
+            self.parar()
+            raise RuntimeError(self.erro or "WASAPI nao iniciou")
+        return self.porta
+
+    def parar(self):
+        self._parar.set()
+        srv, self._srv = self._srv, None
+        if srv:
+            try:
+                # Desbloqueia accept() se ainda estiver esperando.
+                try:
+                    socket.create_connection(("127.0.0.1", srv.getsockname()[1]), timeout=0.3).close()
+                except Exception:
+                    pass
+                srv.close()
+            except Exception:
+                pass
+        thr, self._thread = self._thread, None
+        if thr and thr.is_alive() and thr is not threading.current_thread():
+            try:
+                thr.join(timeout=2.0)
+            except Exception:
+                pass
+        self.ativo = False
+        self.porta = 0
+        self._pronto.set()
+
+    def _rodar(self):
+        ole32 = ctypes.windll.ole32
+        HRESULT = ctypes.c_long
+        conn = None
+        stop_fn = None
+        try:
+            ole32.CoInitializeEx(None, 0)
+            enum_obj = c_void_p()
+            hr = ole32.CoCreateInstance(
+                byref(_GUID(_GUID_MMENUM)), None, _CLSCTX_ALL,
+                byref(_GUID(_GUID_IMMENUM)), byref(enum_obj))
+            if hr < 0:
+                raise RuntimeError("CoCreateInstance 0x%X" % (hr & 0xffffffff))
+            get_default = _com_vt(
+                enum_obj, 4, HRESULT, wintypes.DWORD, wintypes.DWORD, POINTER(c_void_p))
+            dev = c_void_p()
+            hr = get_default(0, 0, byref(dev))
+            if hr < 0:
+                raise RuntimeError("GetDefaultAudioEndpoint 0x%X" % (hr & 0xffffffff))
+            activate = _com_vt(
+                dev, 3, HRESULT, POINTER(_GUID), wintypes.DWORD, c_void_p, POINTER(c_void_p))
+            client = c_void_p()
+            hr = activate(byref(_GUID(_GUID_IAUDIOCLIENT)), _CLSCTX_ALL, None, byref(client))
+            if hr < 0:
+                raise RuntimeError("Activate IAudioClient 0x%X" % (hr & 0xffffffff))
+            get_mix = _com_vt(client, 8, HRESULT, POINTER(POINTER(_WAVEFORMATEX)))
+            pwfx = POINTER(_WAVEFORMATEX)()
+            hr = get_mix(byref(pwfx))
+            if hr < 0:
+                raise RuntimeError("GetMixFormat 0x%X" % (hr & 0xffffffff))
+            wfx = pwfx.contents
+            self.rate = int(wfx.nSamplesPerSec or 48000)
+            self.channels = int(wfx.nChannels or 2)
+            initialize = _com_vt(
+                client, 3, HRESULT, wintypes.DWORD, wintypes.DWORD,
+                c_longlong, c_longlong, POINTER(_WAVEFORMATEX), POINTER(_GUID))
+            hr = initialize(0, _AUDCLNT_STREAMFLAGS_LOOPBACK, 5000000, 0, pwfx, None)
+            if hr < 0:
+                raise RuntimeError("Initialize loopback 0x%X" % (hr & 0xffffffff))
+            get_service = _com_vt(client, 14, HRESULT, POINTER(_GUID), POINTER(c_void_p))
+            cap = c_void_p()
+            hr = get_service(byref(_GUID(_GUID_IAUDIOCAPTURE)), byref(cap))
+            if hr < 0:
+                raise RuntimeError("GetService capture 0x%X" % (hr & 0xffffffff))
+            start = _com_vt(client, 10, HRESULT)
+            stop_fn = _com_vt(client, 11, HRESULT)
+            get_buffer = _com_vt(
+                cap, 3, HRESULT, POINTER(POINTER(c_byte)), POINTER(c_uint32),
+                POINTER(c_ulong), POINTER(c_uint64), POINTER(c_uint64))
+            release_buffer = _com_vt(cap, 4, HRESULT, c_uint32)
+            next_pkt = _com_vt(cap, 5, HRESULT, POINTER(c_uint32))
+            start()
+
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(1)
+            srv.settimeout(20)
+            self._srv = srv
+            self.porta = srv.getsockname()[1]
+            self._pronto.set()
+
+            conn, _addr = srv.accept()
+            if self._parar.is_set():
+                return
+            conn.settimeout(1.0)
+            self.ativo = True
+            log("wasapi loopback no ar @ %d Hz porta %d" % (self.rate, self.porta))
+            eh_float = (wfx.wFormatTag == 3) or (wfx.wFormatTag == 0xFFFE)
+            ch = max(1, int(wfx.nChannels))
+            rate = max(8000, int(self.rate))
+            silencio_frames = max(1, rate // 50)
+            ultimo_envio = time.time()
+            while not self._parar.is_set():
+                pkt = c_uint32(0)
+                next_pkt(byref(pkt))
+                if pkt.value == 0:
+                    if time.time() - ultimo_envio >= 0.02:
+                        try:
+                            conn.sendall(b"\x00\x00\x00\x00" * silencio_frames)
+                            ultimo_envio = time.time()
+                        except OSError:
+                            break
+                    time.sleep(0.004)
+                    continue
+                data = POINTER(c_byte)()
+                nframes = c_uint32(0)
+                flags = c_ulong(0)
+                get_buffer(byref(data), byref(nframes), byref(flags), None, None)
+                nbytes = int(nframes.value) * int(wfx.nBlockAlign)
+                raw = string_at(data, nbytes)
+                release_buffer(nframes.value)
+                if flags.value & 0x2:
+                    pcm = b"\x00\x00\x00\x00" * int(nframes.value)
+                elif eh_float and nbytes >= 4:
+                    out = bytearray()
+                    passo = 4 * ch
+                    for i in range(0, nbytes - passo + 1, passo):
+                        L = struct.unpack_from("<f", raw, i)[0]
+                        R = struct.unpack_from("<f", raw, i + 4)[0] if ch > 1 else L
+                        L = max(-1.0, min(1.0, float(L)))
+                        R = max(-1.0, min(1.0, float(R)))
+                        out += struct.pack("<hh", int(L * 32767), int(R * 32767))
+                    pcm = bytes(out)
+                elif wfx.wBitsPerSample == 16:
+                    if ch == 2:
+                        pcm = raw
+                    else:
+                        out = bytearray()
+                        for i in range(0, len(raw) - 1, 2):
+                            out += raw[i:i + 2] * 2
+                        pcm = bytes(out)
+                else:
+                    continue
+                if not pcm:
+                    continue
+                try:
+                    conn.sendall(pcm)
+                    ultimo_envio = time.time()
+                except OSError:
+                    break
+        except Exception as e:
+            self.erro = str(e)
+            log("wasapi loopback:", e)
+            self._pronto.set()
+        finally:
+            self.ativo = False
+            try:
+                if stop_fn:
+                    stop_fn()
+            except Exception:
+                pass
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
+            try:
+                if self._srv:
+                    self._srv.close()
+            except Exception:
+                pass
+            self._srv = None
+            try:
+                ole32.CoUninitialize()
+            except Exception:
+                pass
+            self._pronto.set()
+
+
+def _achar_csc():
+    """Compilador C# do .NET Framework (sempre presente no Windows)."""
+    base = os.path.join(os.environ.get("WINDIR", r"C:\Windows"),
+                        "Microsoft.NET", "Framework64")
+    for ver in ("v4.0.30319", "v3.5"):
+        csc = os.path.join(base, ver, "csc.exe")
+        if os.path.isfile(csc):
+            return csc
+    return shutil.which("csc") or ""
+
+
+def garantir_helper_audio_pid():
+    """Compila captura-audio-pid.exe no cache se ainda nao existir."""
+    exe = os.path.join(DIR_CACHE, "captura-audio-pid.exe")
+    stamp = os.path.join(DIR_CACHE, "captura-audio-pid.ver")
+    cs = os.path.join(_dir_script(), "captura-audio-pid.cs")
+    if not os.path.isfile(cs):
+        raise RuntimeError("captura-audio-pid.cs nao encontrado em %s" % _dir_script())
+    precisa = True
+    if os.path.isfile(exe) and os.path.isfile(stamp):
+        try:
+            if (open(stamp, encoding="utf-8").read().strip() == HELPER_AUDIO_VER
+                    and os.path.getmtime(exe) >= os.path.getmtime(cs)):
+                precisa = False
+        except Exception:
+            precisa = True
+    if not precisa:
+        return exe
+    csc = _achar_csc()
+    if not csc:
+        raise RuntimeError("csc.exe nao encontrado (precisa do .NET Framework)")
+    os.makedirs(DIR_CACHE, exist_ok=True)
+    tmp = exe + ".tmp.exe"
+    kwargs = dict(capture_output=True, text=True, timeout=60)
+    kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    r = subprocess.run(
+        [csc, "/nologo", "/optimize+", "/platform:x64", "/out:" + tmp, cs],
+        **kwargs)
+    if r.returncode != 0 or not os.path.isfile(tmp):
+        err = (r.stderr or r.stdout or "").strip()
+        raise RuntimeError("falha ao compilar captura-audio-pid: %s" % (err[:400] or r.returncode))
+    try:
+        if os.path.isfile(exe):
+            os.remove(exe)
+    except Exception:
+        pass
+    os.replace(tmp, exe)
+    with open(stamp, "w", encoding="utf-8") as f:
+        f.write(HELPER_AUDIO_VER)
+    log("helper de audio por processo compilado:", exe)
+    return exe
+
+
+class WasapiProcessLoopback:
+    """Som so do PID (e filhos), via helper C# + TCP PCM s16le 48kHz."""
+
+    def __init__(self, pid, include=True):
+        self.pid = int(pid)
+        self.include = bool(include)
+        self.porta = 0
+        self.rate = 48000
+        self.channels = 2
+        self.ativo = False
+        self.erro = ""
+        self._proc = None
+
+    def preparar(self):
+        self.parar()
+        self.erro = ""
+        exe = garantir_helper_audio_pid()
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", 0))
+        porta = s.getsockname()[1]
+        s.close()
+        modo = "include" if self.include else "exclude"
+        kwargs = dict(
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL, bufsize=0, env=ambiente())
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        self._proc = subprocess.Popen(
+            [exe, str(self.pid), modo, str(porta)], **kwargs)
+        linhas = queue.Queue()
+
+        def _le_stderr():
+            try:
+                for raw in iter(self._proc.stderr.readline, b""):
+                    if not raw:
+                        break
+                    linhas.put(raw.decode("utf-8", "replace").strip())
+            except Exception:
+                pass
+            linhas.put(None)
+
+        threading.Thread(target=_le_stderr, daemon=True).start()
+        prazo = time.time() + 12
+        while time.time() < prazo:
+            if self._proc.poll() is not None and linhas.empty():
+                self.erro = self.erro or "helper de audio saiu cedo"
+                self.parar()
+                raise RuntimeError(self.erro)
+            try:
+                linha = linhas.get(timeout=0.2)
+            except queue.Empty:
                 continue
-            mics.append({"nome": name, "rotulo": name[:48]})
-        return mics
+            if linha is None:
+                break
+            if not linha:
+                continue
+            log("audio-pid:", linha)
+            if linha.startswith("READY"):
+                self.porta = porta
+                self.ativo = True
+                threading.Thread(target=self._drena_fila, args=(linhas,),
+                                 daemon=True).start()
+                log("audio so do processo %s @ %d Hz porta %d" % (
+                    self.pid, self.rate, self.porta))
+                return self.porta
+            if any(x in linha for x in ("failed", "fail", "error", "timeout")):
+                self.erro = linha[:300]
+            elif "0x" in linha and "Activate" in linha:
+                self.erro = linha[:300]
+        self.erro = self.erro or "timeout ao iniciar audio do processo"
+        self.parar()
+        raise RuntimeError(self.erro)
+
+    def _drena_fila(self, linhas):
+        try:
+            while True:
+                try:
+                    linha = linhas.get(timeout=1.0)
+                except queue.Empty:
+                    if not self._proc or self._proc.poll() is not None:
+                        break
+                    continue
+                if linha is None:
+                    break
+                if linha:
+                    log("audio-pid:", linha)
+        except Exception:
+            pass
+
+    def parar(self):
+        self.ativo = False
+        p, self._proc = self._proc, None
+        if not p:
+            self.porta = 0
+            return
+        try:
+            if p.poll() is None:
+                p.terminate()
+                try:
+                    p.wait(timeout=1.5)
+                except Exception:
+                    p.kill()
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+        try:
+            if p.stderr:
+                p.stderr.close()
+        except Exception:
+            pass
+        self.porta = 0
+
+
+def _eh_loopback_ou_virtual(nome):
+    baixo = (nome or "").lower()
+    return any(x in baixo for x in (
+        "stereo mix", "what u hear", "loopback", "wave out mix",
+        "cable output", "cable input", "vb-audio", "virtual cable",
+    ))
+
+
+def preferir_microfone(mics, atual=""):
+    """Prioriza o microfone wireless; senão mantém o atual se ainda existir."""
+    if not mics:
+        return ""
+    nomes = [m["nome"] for m in mics]
+    if atual and atual in nomes:
+        return atual
+    for n in nomes:
+        baixo = n.lower()
+        if "wireless" in baixo or "sem fio" in baixo:
+            return n
+    return nomes[0]
+
+
+def listar_microfones(forcar=False):
+    agora = time.time()
+    if (not forcar and _CACHE_MICS["lista"] is not None
+            and agora - _CACHE_MICS["em"] < 60):
+        return list(_CACHE_MICS["lista"])
+
+    # No caminho normal do painel: nunca bloqueia. Devolve cache e aquece fora.
+    if not forcar:
+        if _CACHE_MICS["lista"] is None:
+            threading.Thread(target=aquecer_cache_mics, daemon=True).start()
+        return list(_CACHE_MICS["lista"] or [])
+
+    if IS_WINDOWS:
+        nomes = []
+        for name in _microfones_windows_pnp():
+            if not _eh_loopback_ou_virtual(name):
+                nomes.append(name)
+        if not nomes:
+            for name in _dshow_audio_devices(forcar=True):
+                if _eh_loopback_ou_virtual(name):
+                    continue
+                if name.lower() not in {n.lower() for n in nomes}:
+                    nomes.append(name)
+
+        mics = [{"nome": n, "rotulo": n[:64]} for n in nomes]
+        mics.sort(key=lambda m: (
+            0 if ("wireless" in m["nome"].lower() or "sem fio" in m["nome"].lower()) else 1,
+            m["nome"].lower()
+        ))
+        if mics:
+            _CACHE_MICS["lista"] = mics
+            _CACHE_MICS["em"] = agora
+        elif _CACHE_MICS["lista"]:
+            return list(_CACHE_MICS["lista"])
+        return list(mics)
 
     saida = rodar(["pactl", "list", "short", "sources"])
     fontes = []
@@ -531,6 +1442,14 @@ def listar_microfones():
                       .replace("_", " "))
         fontes.append({"nome": nome, "rotulo": rotulo[:48]})
     return fontes
+
+
+def aquecer_cache_mics():
+    try:
+        listar_microfones(forcar=True)
+        log("cache de mics pronto:", len(_CACHE_MICS["lista"] or []))
+    except Exception as e:
+        log("aquecer mics:", e)
 
 
 def tem_vaapi():
@@ -624,9 +1543,17 @@ class MesaDeSom:
 
     def monitor(self):
         if IS_WINDOWS:
-            # No Windows o som do sistema so entra se existir Stereo Mix / Cable.
-            return listar_loopback_windows() or None
-        return SINK_MESA + ".monitor" if self.modulo else None
+            with self.trava:
+                pid = self.pid_alvo
+            # Janela escolhida: so o audio daquele processo (nao Stereo Mix).
+            if pid:
+                return ("wasapi_proc", int(pid))
+            # Desktop inteiro: Stereo Mix/Cable se existir; senao WASAPI geral.
+            dshow = listar_loopback_windows()
+            if dshow:
+                return ("dshow", dshow)
+            return ("wasapi", None)
+        return ("pulse", SINK_MESA + ".monitor") if self.modulo else None
 
     def limpar_restos(self):
         if IS_WINDOWS:
@@ -788,14 +1715,28 @@ class MesaDeSom:
 
     def estado(self):
         with self.trava:
+            if IS_WINDOWS:
+                fonte = self.monitor()
+                if fonte and fonte[0] == "wasapi_proc":
+                    modo = "somente o app da janela (PID %s)" % fonte[1]
+                elif fonte and fonte[0] == "dshow":
+                    modo = "Stereo Mix / cabo virtual (%s)" % fonte[1]
+                elif fonte and fonte[0] == "wasapi":
+                    modo = "WASAPI loopback (som que sai nas caixas)"
+                else:
+                    modo = "sem captura de som do sistema"
+                programa = modo
+            else:
+                programa = self.programa or ""
             return {
                 "tem_destino": True if IS_WINDOWS else bool(self.modulo),
                 "achou_programa": True if IS_WINDOWS else self.achou_programa,
-                "programa": self.programa or "Áudio do Sistema Windows",
+                "programa": programa,
                 "microfone": self.mic,
                 "mic_ligado": self.mic_ligado,
                 "mic_no_ar": self.mic_no_ar if not IS_WINDOWS else self.mic_ligado,
                 "tela_inteira": self.usar_sistema,
+                "fonte_windows": (self.monitor() or (None, None))[0] if IS_WINDOWS else "pulse",
             }
 
     def limpar(self):
@@ -893,6 +1834,8 @@ PADRAO = {
     "alvo": "",
     "microfone": "",
     "mic_ligado": False,
+    "qualidade": "1080p",
+    "atraso": ATRASO_PADRAO,
 }
 
 
@@ -901,7 +1844,7 @@ class Captura:
         self.trava = threading.RLock()
         self.mesa = mesa
         self.opcoes = dict(PADRAO)
-        self.nivel = 0
+        self.nivel = NIVEL_PADRAO
         self.codificador = encoder_preferido()
         self.gen = 0
         self.proc = None
@@ -921,7 +1864,14 @@ class Captura:
         self.quedas = 0
         self.dimensoes = ""
         self.pausado_por_janela = False
-        self._modo_janela = "titulo"  # titulo | regiao (fallback Windows)
+        # printwindow = PrintWindow (funciona coberta); titulo/regiao = fallback gdigrab
+        self._modo_janela = "printwindow"
+        self._feeder_stop = threading.Event()
+        self._feeder_thread = None
+        self._cap_wh = (0, 0)
+        self._wasapi = None
+        self._wasapi_porta = 0
+        self._audio_inputs = []
         threading.Thread(target=self._medidor, daemon=True).start()
         threading.Thread(target=self._vigia_janela, daemon=True).start()
 
@@ -931,14 +1881,73 @@ class Captura:
             for k in PADRAO:
                 if k in novas:
                     self.opcoes[k] = novas[k]
+            if "qualidade" in novas:
+                self._aplicar_qualidade_nome(novas["qualidade"], reiniciar=False)
             if self.opcoes.get("alvo") != alvo_antes:
-                self._modo_janela = "titulo"
+                self._modo_janela = "printwindow"
             rodando = self.deve_rodar
         self._ajustar_som()
         if rodando:
             with self.trava:
                 self._parar_processo()
                 self._iniciar_processo()
+
+    def _indice_qualidade(self, nome):
+        nome = (nome or "").strip().lower().replace(" ", "")
+        for i, n in enumerate(NIVEIS):
+            if n["nome"].lower() == nome:
+                return i
+        if nome in ("480", "480p30", "sd"):
+            return 0
+        if nome in ("720", "720p30"):
+            return 1
+        if nome in ("1080", "1080p30", "fullhd"):
+            return 2
+        return None
+
+    def _aplicar_qualidade_nome(self, nome, reiniciar=True):
+        idx = self._indice_qualidade(nome)
+        if idx is None:
+            return False
+        if idx == self.nivel:
+            self.opcoes["qualidade"] = NIVEIS[idx]["nome"]
+            return False
+        self.nivel = idx
+        self.opcoes["qualidade"] = NIVEIS[idx]["nome"]
+        self.aviso_nivel = ""
+        log("qualidade ->", NIVEIS[idx]["nome"])
+        if reiniciar and self.deve_rodar:
+            self._parar_processo()
+            self._iniciar_processo()
+        return True
+
+    def definir_qualidade(self, nome):
+        with self.trava:
+            ok = self._aplicar_qualidade_nome(nome, reiniciar=True)
+            return ok or self._indice_qualidade(nome) is not None
+
+    def definir_atraso(self, segundos):
+        try:
+            n = int(segundos)
+        except (TypeError, ValueError):
+            return False
+        if n not in ATRASOS_OK:
+            return False
+        with self.trava:
+            if self.opcoes.get("atraso") == n:
+                return True
+            self.opcoes["atraso"] = n
+            log("atraso do host ->", n, "s")
+            return True
+
+    def atraso_atual(self):
+        with self.trava:
+            n = self.opcoes.get("atraso", ATRASO_PADRAO)
+        try:
+            n = int(n)
+        except (TypeError, ValueError):
+            n = ATRASO_PADRAO
+        return n if n in ATRASOS_OK else ATRASO_PADRAO
 
     def ajustar_microfone(self, nome, ligado):
         with self.trava:
@@ -958,9 +1967,11 @@ class Captura:
             self.deve_rodar = True
             self.pausado_por_janela = False
             self.falhas = 0
-            self.nivel = 0
+            # Mantem a qualidade escolhida; so sincroniza o nome.
+            self.nivel = max(0, min(len(NIVEIS) - 1, self.nivel))
+            self.opcoes["qualidade"] = NIVEIS[self.nivel]["nome"]
             self.aviso_nivel = ""
-            self._modo_janela = "titulo"
+            self._modo_janela = "printwindow"
             self._parar_processo()
             self._iniciar_processo()
 
@@ -991,11 +2002,31 @@ class Captura:
         self.mesa.definir_microfone(mic, ligado)
 
     def _parar_processo(self):
+        self._feeder_stop.set()
+        if self._wasapi:
+            try:
+                self._wasapi.parar()
+            except Exception:
+                pass
+            self._wasapi = None
         p, self.proc = self.proc, None
         self.init_seg = None
         for a in list(self.assinantes):
             a.encerrar()
         self.assinantes.clear()
+        if p is not None:
+            try:
+                if p.stdin:
+                    p.stdin.close()
+            except Exception:
+                pass
+        feeder = self._feeder_thread
+        self._feeder_thread = None
+        if feeder and feeder.is_alive() and feeder is not threading.current_thread():
+            try:
+                feeder.join(timeout=1.5)
+            except Exception:
+                pass
         if p and p.poll() is None:
             try:
                 p.terminate()
@@ -1011,17 +2042,24 @@ class Captura:
             self.estado = "escolha uma janela"
             return
         tipo, _, ref = self.opcoes["alvo"].partition(":")
-        if tipo == "janela":
-            # Sempre traz a janela pra frente antes de capturar.
-            if not janela_visivel(ref):
-                if not restaurar_janela(ref):
-                    self.estado = "janela minimizada"
-                    self.erro = ("Essa janela esta minimizada. Restaure ela na tela "
-                                 "para poder transmitir.")
-                    self.deve_rodar = False
-                    return
-            else:
-                restaurar_janela(ref)
+        usar_pipe = False
+        if tipo == "janela" and IS_WINDOWS:
+            # Nao rouba foco: so garante que nao esta minimizada.
+            if not garantir_janela_capturavel(ref):
+                self.estado = "janela minimizada"
+                self.erro = ("Essa janela esta minimizada. Restaure ela na tela "
+                             "(pode ficar atras de outras) para transmitir.")
+                self.deve_rodar = False
+                return
+            if getattr(self, "_modo_janela", "printwindow") == "printwindow":
+                w, h = tamanho_janela_captura(ref)
+                if w >= 16 and h >= 16:
+                    self._cap_wh = (w, h)
+                    usar_pipe = True
+                else:
+                    log("PrintWindow sem tamanho util (janela minimizada?)")
+                    self._cap_wh = (0, 0)
+
         cmd = self._montar_comando()
         self.dimensoes = "%dx%d" % (NIVEIS[self.nivel]["larg"], NIVEIS[self.nivel]["alt"])
         self.gen += 1
@@ -1031,48 +2069,196 @@ class Captura:
         self.erro = ""
         self.velocidade = ""
         self.inicio = time.time()
-        log("captura gen", gen, "nivel", self.nivel, self.codificador,
-            "alvo", self.opcoes["alvo"], "modo", getattr(self, "_modo_janela", ""))
+        log("captura gen", gen, "nivel", self.nivel, NIVEIS[self.nivel]["nome"],
+            self.codificador, "alvo", self.opcoes["alvo"], "modo",
+            getattr(self, "_modo_janela", ""),
+            "size", "%dx%d" % self._cap_wh if usar_pipe else "-",
+            "audio", (self.mesa.monitor() or ("?",))[0])
         try:
+            # WASAPI / audio do processo: sobe o TCP antes do ffmpeg conectar.
+            if IS_WINDOWS:
+                fonte = self.mesa.monitor()
+                if fonte and fonte[0] in ("wasapi", "wasapi_proc"):
+                    try:
+                        if fonte[0] == "wasapi_proc":
+                            self._wasapi = WasapiProcessLoopback(fonte[1], include=True)
+                        else:
+                            self._wasapi = WasapiLoopback()
+                        porta = self._wasapi.preparar()
+                        self._wasapi_porta = porta
+                        cmd = self._montar_comando()
+                    except Exception as e:
+                        log("audio wasapi indisponivel:", e)
+                        if self._wasapi:
+                            try:
+                                self._wasapi.parar()
+                            except Exception:
+                                pass
+                        self._wasapi = None
+                        self._wasapi_porta = 0
+                        cmd = self._montar_comando()
             kwargs = dict(
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                stdin=subprocess.DEVNULL, bufsize=0, env=ambiente())
+                bufsize=0, env=ambiente())
+            if usar_pipe:
+                kwargs["stdin"] = subprocess.PIPE
+            else:
+                kwargs["stdin"] = subprocess.DEVNULL
             if IS_WINDOWS:
                 kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             self.proc = subprocess.Popen(cmd, **kwargs)
         except FileNotFoundError:
+            if self._wasapi:
+                self._wasapi.parar()
+                self._wasapi = None
             self.estado = "erro"
             self.erro = "FFmpeg nao encontrado. No Windows: winget install Gyan.FFmpeg"
+            return
+        except Exception as e:
+            if self._wasapi:
+                self._wasapi.parar()
+                self._wasapi = None
+            self.estado = "erro"
+            self.erro = "Falha ao iniciar captura: %s" % e
+            log("iniciar captura:", e)
             return
         self.estado = "iniciando"
         threading.Thread(target=self._leitor, args=(self.proc, gen), daemon=True).start()
         threading.Thread(target=self._erros, args=(self.proc, gen), daemon=True).start()
+        if usar_pipe:
+            self._feeder_stop.clear()
+            self._feeder_thread = threading.Thread(
+                target=self._alimentar_printwindow,
+                args=(self.proc, gen, ref, NIVEIS[self.nivel]["fps"]),
+                daemon=True)
+            self._feeder_thread.start()
+
+    def _alimentar_printwindow(self, proc, gen, jid, fps):
+        """Envia frames BGR da HWND para o stdin do ffmpeg (janela coberta ok)."""
+        intervalo = 1.0 / max(1, int(fps or 30))
+        hwnd = int(str(jid), 0)
+        falhas = 0
+        pendente_resize = None
+        ultimo_frame = None
+        aviso_min = 0.0
+        while not self._feeder_stop.is_set():
+            t0 = time.perf_counter()
+            with self.trava:
+                if gen != self.gen or proc is not self.proc or not self.deve_rodar:
+                    break
+                w0, h0 = self._cap_wh
+            if not ctypes.windll.user32.IsWindow(hwnd):
+                log("PrintWindow: janela fechada")
+                break
+            w, h = tamanho_janela_captura(hwnd)
+            if w < 16 or h < 16:
+                falhas += 1
+                # Minimizada de verdade: tenta restaurar sem roubar foco.
+                # Enquanto isso reenvia o ultimo frame (stream nao cai).
+                if falhas == 1 or falhas % 40 == 0:
+                    garantir_janela_capturavel(hwnd)
+                if ultimo_frame is not None:
+                    frame = ultimo_frame
+                    agora = time.perf_counter()
+                    if agora - aviso_min > 8:
+                        log("PrintWindow: janela sem tamanho (minimizou?); mantendo ultimo frame")
+                        aviso_min = agora
+                else:
+                    frame = bytes(w0 * h0 * 3)
+                    time.sleep(0.05)
+                    try:
+                        proc.stdin.write(frame)
+                        proc.stdin.flush()
+                    except (BrokenPipeError, OSError, ValueError):
+                        break
+                    continue
+            else:
+                # Ignora trepidacao de 1-2px (borda DWM). So reinicia se mudou de verdade.
+                if abs(w - w0) > 16 or abs(h - h0) > 16:
+                    if pendente_resize is None:
+                        pendente_resize = (w, h, time.perf_counter())
+                    else:
+                        pw, ph, pt = pendente_resize
+                        if abs(w - pw) <= 8 and abs(h - ph) <= 8 and (time.perf_counter() - pt) >= 0.6:
+                            log("PrintWindow: tamanho mudou %dx%d -> %dx%d, reiniciando" % (w0, h0, w, h))
+                            with self.trava:
+                                if gen == self.gen and self.deve_rodar:
+                                    self._cap_wh = (w, h)
+                                    threading.Thread(target=self._reiniciar_suave, daemon=True).start()
+                            return
+                        if abs(w - pw) > 8 or abs(h - ph) > 8:
+                            pendente_resize = (w, h, time.perf_counter())
+                else:
+                    pendente_resize = None
+                # Sempre captura no tamanho travado do processo ffmpeg (w0xh0).
+                frame = capturar_hwnd_bgr(hwnd, w0, h0)
+                if frame is None or len(frame) < w0 * h0 * 3:
+                    falhas += 1
+                    frame = ultimo_frame if ultimo_frame is not None else bytes(w0 * h0 * 3)
+                    if falhas == 30:
+                        log("PrintWindow: frames vazios (app pode usar DirectX puro)")
+                else:
+                    if len(frame) > w0 * h0 * 3:
+                        frame = frame[:w0 * h0 * 3]
+                    ultimo_frame = frame
+                    falhas = 0
+            try:
+                proc.stdin.write(frame)
+                proc.stdin.flush()
+            except (BrokenPipeError, OSError, ValueError):
+                break
+            restante = intervalo - (time.perf_counter() - t0)
+            if restante > 0:
+                fim = time.perf_counter() + restante
+                while time.perf_counter() < fim and not self._feeder_stop.is_set():
+                    time.sleep(min(0.005, max(0.0, fim - time.perf_counter())))
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except Exception:
+            pass
+
+    def _reiniciar_suave(self):
+        time.sleep(0.05)
+        with self.trava:
+            if not self.deve_rodar:
+                return
+            self._parar_processo()
+            self._iniciar_processo()
 
     def _montar_comando(self):
         n = NIVEIS[self.nivel]
-        cmd = [FFMPEG_BIN, "-hide_banner", "-loglevel", "warning", "-nostdin"]
         tipo, _, ref = self.opcoes["alvo"].partition(":")
+        modo = getattr(self, "_modo_janela", "printwindow")
+        usar_pipe = (IS_WINDOWS and tipo == "janela" and modo == "printwindow"
+                     and self._cap_wh[0] >= 16)
+
+        cmd = [FFMPEG_BIN, "-hide_banner", "-loglevel", "warning"]
+        if not usar_pipe:
+            cmd.append("-nostdin")
         tem_audio = False
 
         if IS_WINDOWS:
-            if tipo == "janela":
-                # Preferir title= (isola a janela). Se falhar / sem titulo,
-                # usa a regiao da janela no desktop (apos focar no _iniciar).
+            if tipo == "janela" and usar_pipe:
+                w, h = self._cap_wh
+                cmd += [
+                    "-f", "rawvideo", "-pix_fmt", "bgr24",
+                    "-s:v", "%dx%d" % (w, h),
+                    "-r", str(n["fps"]),
+                    "-thread_queue_size", "64",
+                    "-i", "pipe:0",
+                ]
+            elif tipo == "janela":
+                # Sem PrintWindow (tamanho invalido): ainda evita gdigrab de
+                # regiao, que transmite o que esta na frente (YouTube etc).
                 janela = next((j for j in listar_janelas()
                                if str(j["id"]) == str(ref)), None)
                 titulo = titulo_janela(ref) or ((janela or {}).get("titulo") or "")
-                modo = getattr(self, "_modo_janela", "titulo")
-                geo = geometria_janela(ref)
-                if modo == "titulo" and titulo.strip():
+                if titulo.strip():
+                    log("aviso: PrintWindow indisponivel, tentando title= (pode falhar coberta)")
                     cmd += ["-f", "gdigrab", "-framerate", str(n["fps"]),
                             "-thread_queue_size", "1024", "-draw_mouse", "0",
                             "-i", "title=%s" % titulo]
-                elif geo:
-                    cmd += ["-f", "gdigrab", "-framerate", str(n["fps"]),
-                            "-offset_x", str(geo["x"]), "-offset_y", str(geo["y"]),
-                            "-video_size", "%dx%d" % (geo["w"], geo["h"]),
-                            "-thread_queue_size", "1024", "-draw_mouse", "0",
-                            "-i", "desktop"]
                 else:
                     cmd += ["-f", "gdigrab", "-framerate", str(n["fps"]),
                             "-thread_queue_size", "1024", "-draw_mouse", "0",
@@ -1091,19 +2277,37 @@ class Captura:
                             "-thread_queue_size", "1024", "-draw_mouse", "0",
                             "-i", "desktop"]
 
-            # Audio: Stereo Mix/Cable se existir; microfone se o dono ligar.
-            loop = self.mesa.monitor()
+            # Audio: processo (janela), Stereo Mix/Cable, ou WASAPI geral via TCP.
+            fonte = self.mesa.monitor()
             mic = self.opcoes.get("microfone") or ""
             mic_on = bool(self.opcoes.get("mic_ligado") and mic)
-            audio_inputs = []
-            if loop:
-                audio_inputs.append(loop)
-            if mic_on and mic not in audio_inputs:
-                audio_inputs.append(mic)
-            for nome_aud in audio_inputs:
-                cmd += ["-f", "dshow", "-thread_queue_size", "1024",
-                        "-i", "audio=%s" % nome_aud]
+            audio_inputs = []  # ("dshow"|"wasapi"|"pulse", nome_ou_porta)
+            if fonte:
+                if fonte[0] == "dshow":
+                    audio_inputs.append(("dshow", fonte[1]))
+                elif fonte[0] in ("wasapi", "wasapi_proc"):
+                    porta = getattr(self, "_wasapi_porta", 0) or (
+                        self._wasapi.porta if self._wasapi else 0)
+                    if porta:
+                        audio_inputs.append(("wasapi", porta))
+            if mic_on:
+                if not any(t == "dshow" and r == mic for t, r in audio_inputs):
+                    audio_inputs.append(("dshow", mic))
+            for tipo_a, ref_a in audio_inputs:
+                if tipo_a == "dshow":
+                    cmd += ["-f", "dshow", "-thread_queue_size", "1024",
+                            "-i", "audio=%s" % ref_a]
+                elif tipo_a == "wasapi":
+                    # PCM cru: timestamps por taxa de amostragem (nao wallclock),
+                    # senao o muxer MP4 explode com DTS gigante.
+                    cmd += [
+                        "-f", "s16le", "-ar", "48000", "-ac", "2",
+                        "-channel_layout", "stereo",
+                        "-thread_queue_size", "1024",
+                        "-i", "tcp://127.0.0.1:%d" % int(ref_a),
+                    ]
             tem_audio = bool(audio_inputs)
+            self._audio_inputs = audio_inputs
 
         else:
             display = ambiente()["DISPLAY"]
@@ -1124,26 +2328,32 @@ class Captura:
                         "-i", "%s+%d,%d" % (display, tela["x"], tela["y"])]
 
             fonte = self.mesa.monitor()
-            if fonte:
-                cmd += ["-f", "pulse", "-thread_queue_size", "1024", "-i", fonte]
+            if fonte and fonte[0] == "pulse" and fonte[1]:
+                cmd += ["-f", "pulse", "-thread_queue_size", "1024", "-i", fonte[1]]
                 tem_audio = True
+                self._audio_inputs = [("pulse", fonte[1])]
+            else:
+                self._audio_inputs = []
 
-        # Quadro fixo 1920x1080 (ou nivel atual) com tarja.
+        # Escala para o nivel escolhido (480p/720p/1080p) @ 30fps CFR.
+        larg, alt, fps = n["larg"], n["alt"], n["fps"]
         if self.codificador == "vaapi" and tem_vaapi() and not IS_WINDOWS:
             filtros = (
+                "fps=%d,"
                 "scale=%d:%d:force_original_aspect_ratio=decrease:flags=bicubic,"
                 "pad=%d:%d:(ow-iw)/2:(oh-ih)/2,format=nv12,hwupload"
-                % (n["larg"], n["alt"], n["larg"], n["alt"])
+                % (fps, larg, alt, larg, alt)
             )
         else:
             filtros = (
+                "fps=%d,"
                 "scale=%d:%d:force_original_aspect_ratio=decrease:flags=bicubic,"
                 "pad=%d:%d:(ow-iw)/2:(oh-ih)/2,format=yuv420p"
-                % (n["larg"], n["alt"], n["larg"], n["alt"])
+                % (fps, larg, alt, larg, alt)
             )
-        cmd += ["-vf", filtros]
+        cmd += ["-vf", filtros, "-r", str(fps), "-fps_mode", "cfr"]
 
-        gop = str(n["fps"] * 2)
+        gop = str(fps * 2)
         k = n["kbps"]
         enc = self.codificador
         if enc == "nvenc":
@@ -1166,47 +2376,40 @@ class Captura:
                     "-profile:v", "high", "-level", "4.2",
                     "-b:v", "%dk" % k, "-maxrate", "%dk" % k,
                     "-bufsize", "%dk" % (k * 2),
-                    "-g", gop, "-keyint_min", gop, "-sc_threshold", "0", "-bf", "2"]
+                    "-g", gop, "-keyint_min", gop, "-sc_threshold", "0", "-bf", "2",
+                    "-x264-params", "force-cfr=1"]
 
         if tem_audio:
-            if IS_WINDOWS:
-                loop = self.mesa.monitor()
-                mic = self.opcoes.get("microfone") or ""
-                mic_on = bool(self.opcoes.get("mic_ligado") and mic)
-                idx = 1
-                mapas = []
-                if loop:
-                    mapas.append("[%d:a]" % idx)
-                    idx += 1
-                if mic_on and mic != loop:
-                    mapas.append("[%d:a]" % idx)
-                if len(mapas) > 1:
-                    cmd += ["-filter_complex",
-                            "".join(mapas) + "amix=inputs=%d:duration=first:dropout_transition=0[aout]" % len(mapas),
-                            "-map", "0:v:0", "-map", "[aout]",
-                            "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]
-                else:
-                    cmd += ["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
-                            "-af", "aresample=async=1000",
-                            "-map", "0:v:0", "-map", "1:a:0"]
+            entradas = getattr(self, "_audio_inputs", []) or []
+            af = "volume=%.2f,aresample=async=1000:first_pts=0" % AUDIO_GANHO
+            if len(entradas) > 1:
+                mapas = ["[%d:a]" % (i + 1) for i in range(len(entradas))]
+                cmd += ["-filter_complex",
+                        "".join(mapas) +
+                        "amix=inputs=%d:duration=first:dropout_transition=0,"
+                        "%s[aout]" % (len(mapas), af),
+                        "-map", "0:v:0", "-map", "[aout]",
+                        "-c:a", "aac", "-b:a", "256k", "-ar", "48000", "-ac", "2"]
             else:
-                cmd += ["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
-                        "-af", "aresample=async=1000",
+                cmd += ["-c:a", "aac", "-b:a", "256k", "-ar", "48000", "-ac", "2",
+                        "-af", af,
                         "-map", "0:v:0", "-map", "1:a:0"]
         else:
             cmd += ["-an", "-map", "0:v:0"]
 
-        cmd += ["-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+        cmd += ["-fflags", "+genpts",
+                "-avoid_negative_ts", "make_zero",
+                "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
                 "-flush_packets", "1", "-stats_period", "3",
                 "-progress", "pipe:2", "-f", "mp4", "pipe:1"]
         return cmd
 
     def _mime(self):
-        # Sem audio (Windows sem Stereo Mix e mic desligado) o MSE aceita so AVC.
+        # Sem audio o MSE aceita so AVC; com som inclui AAC.
         if IS_WINDOWS:
-            loop = self.mesa.monitor()
+            fonte = self.mesa.monitor()
             mic_on = bool(self.opcoes.get("mic_ligado") and self.opcoes.get("microfone"))
-            if loop or mic_on:
+            if fonte or mic_on:
                 return 'video/mp4; codecs="avc1.64002A, mp4a.40.2"'
             return 'video/mp4; codecs="avc1.64002A"'
         if self.mesa.monitor():
@@ -1216,14 +2419,62 @@ class Captura:
     def mudar_nivel(self, delta, motivo=""):
         with self.trava:
             novo = max(0, min(len(NIVEIS) - 1, self.nivel + delta))
-            if novo == self.nivel or not self.deve_rodar:
+            if novo == self.nivel:
                 return False
             self.nivel = novo
-            self.aviso_nivel = motivo
+            self.opcoes["qualidade"] = NIVEIS[novo]["nome"]
+            self.aviso_nivel = motivo or ""
             log("qualidade ->", NIVEIS[novo]["nome"], motivo)
-            self._parar_processo()
-            self._iniciar_processo()
+            if self.deve_rodar:
+                self._parar_processo()
+                self._iniciar_processo()
             return True
+
+    def diagnostico_conexao(self, saude="sem publico"):
+        """Texto curto sobre banda e se a transmissao esta ok."""
+        n = NIVEIS[self.nivel]
+        kbps = self.kbps_real
+        alvo = n["kbps"]
+        entupido = any(a.fila.qsize() >= Assinante.ATRASO for a in self.assinantes)
+        if not self.deve_rodar:
+            status = "parado"
+            detalhe = "Transmissao desligada."
+        elif self.estado == "erro":
+            status = "erro"
+            detalhe = self.erro or "Falha na captura."
+        elif self.estado in ("iniciando", "reconectando"):
+            status = "iniciando"
+            detalhe = "Subindo o video..."
+        elif self.estado == "janela minimizada":
+            status = "pausado"
+            detalhe = "Janela minimizada. Restaure para continuar."
+        elif self.estado == "janela fechada":
+            status = "erro"
+            detalhe = "Janela fechada."
+        elif self.estado != "no ar":
+            status = "aviso"
+            detalhe = self.estado or "Aguardando..."
+        elif entupido or saude == "apertado":
+            status = "apertado"
+            detalhe = ("Conexao apertada: quem assiste pode travar. "
+                       "Se continuar, troque para 720p.")
+        elif saude == "sem publico":
+            status = "ok"
+            detalhe = "Transmitindo. Ninguem assistindo ainda."
+        else:
+            status = "ok"
+            detalhe = "Conexao ok. Transmitindo normalmente."
+        return {
+            "status": status,
+            "detalhe": detalhe,
+            "kbps": kbps,
+            "kbps_alvo": alvo,
+            "mbps": round(kbps / 1000.0, 2),
+            "mbps_alvo": round(alvo / 1000.0, 2),
+            "espectadores": len(self.assinantes),
+            "fila_cheia": entupido,
+            "saude": saude,
+        }
 
     @staticmethod
     def _proxima_caixa(buf):
@@ -1334,18 +2585,26 @@ class Captura:
                       or "Cannot load" in l or "nvcuda" in l
                       or "Can't find window" in l or "Error opening input" in l]
             self.erro = pistas[-1] if pistas else ("ffmpeg saiu com codigo %s" % codigo)
-            # title= do gdigrab falhou: cai para captura por regiao da janela.
+            # Nunca cai de PrintWindow para gdigrab de janela: titulo/regiao
+            # so mostram o que esta visivel (VLC atras do YouTube = lixo).
             tipo_alvo, _, _ = self.opcoes.get("alvo", "").partition(":")
-            if (IS_WINDOWS and tipo_alvo == "janela"
-                    and self._modo_janela == "titulo"
-                    and any("Can't find window" in l or "Error opening input" in l
-                            or "I/O error" in l for l in self.registro)):
-                log("title= falhou, caindo para captura por regiao")
-                self._modo_janela = "regiao"
-                self.falhas = 0
-                self.erro = ""
-            # GPU encoder listado mas sem driver/CUDA: cai para CPU.
-            elif self.codificador in ("nvenc", "amf", "qsv") and self.falhas >= 1:
+            texto_erro = (self.erro or "").lower()
+            parece_encoder = any(x in texto_erro for x in (
+                "nvenc", "amf", "qsv", "nvcuda", "h264_qsv", "h264_amf", "h264_nvenc",
+                "cannot load", "cuda", "encoder"))
+            if IS_WINDOWS and tipo_alvo == "janela":
+                self._modo_janela = "printwindow"
+                if (self.codificador in ("nvenc", "amf", "qsv") and self.falhas >= 1
+                        and parece_encoder):
+                    log("encoder", self.codificador, "falhou, caindo para CPU (libx264)")
+                    self.codificador = "cpu"
+                    self.falhas = 0
+                    self.erro = ""
+                elif self.falhas >= 8:
+                    self.deve_rodar = False
+                    self.estado = "erro"
+                    return
+            elif self.codificador in ("nvenc", "amf", "qsv") and self.falhas >= 1 and parece_encoder:
                 log("encoder", self.codificador, "falhou, caindo para CPU (libx264)")
                 self.codificador = "cpu"
                 self.falhas = 0
@@ -1383,51 +2642,62 @@ class Captura:
                     titulo_cache = None
                     continue
                 situacao = estado_janela(ref)
+                if situacao == "minimizada" and (rodando or pausado):
+                    # Fora da trava: ShowWindow + sleep nao podem travar o encoder.
+                    garantir_janela_capturavel(ref)
+                    situacao = estado_janela(ref)
                 with self.trava:
-                    if situacao == "visivel" and pausado:
+                    # So para de verdade se a janela foi FECHADA.
+                    # Coberta, sem foco ou minimizada: continua (PrintWindow /
+                    # restaura sem ativar). Voce pode usar o PC normalmente.
+                    if situacao == "sumiu":
+                        self.pausado_por_janela = False
+                        self.deve_rodar = False
+                        self._parar_processo()
+                        geo_cache = None
+                        titulo_cache = None
+                        self.estado = "janela fechada"
+                        self.erro = "Essa janela foi fechada. Escolha outra na lista."
+                        continue
+                    if pausado and situacao != "sumiu":
+                        # Retoma se ficou pausado por versao antiga / falso IsIconic.
                         self.pausado_por_janela = False
                         self.deve_rodar = True
                         self.erro = ""
                         self.falhas = 0
                         geo_cache = None
                         titulo_cache = None
-                        log("janela voltou, retomando")
+                        log("janela ainda aberta, retomando")
                         self._parar_processo()
                         self._iniciar_processo()
-                    elif situacao != "visivel" and not pausado and rodando:
-                        self.pausado_por_janela = True
-                        self.deve_rodar = False
-                        self._parar_processo()
-                        geo_cache = None
-                        titulo_cache = None
-                        if situacao == "sumiu":
-                            self.estado = "janela fechada"
-                            self.erro = "Essa janela foi fechada. Escolha outra na lista."
-                            self.pausado_por_janela = False
-                        else:
-                            self.estado = "janela minimizada"
-                            self.erro = ("A janela saiu da tela. Restaure ela e a "
-                                         "transmissao volta sozinha.")
-                    elif situacao == "visivel" and rodando and IS_WINDOWS:
-                        if modo == "titulo":
-                            tit = titulo_janela(ref)
-                            if titulo_cache is None:
-                                titulo_cache = tit
-                            elif tit and tit != titulo_cache:
-                                log("titulo da janela mudou, recapturando")
-                                titulo_cache = tit
-                                geo_cache = None
+                        continue
+                    if situacao in ("visivel", "minimizada") and rodando and IS_WINDOWS:
+                        # printwindow nao depende do titulo (VLC muda o titulo o tempo todo)
+                        # e o feeder ja reinicia se o tamanho mudar.
+                        if modo in ("titulo", "regiao"):
+                            if modo == "titulo":
+                                tit = titulo_janela(ref)
+                                if titulo_cache is None:
+                                    titulo_cache = tit
+                                elif tit and tit != titulo_cache:
+                                    log("titulo da janela mudou, recapturando")
+                                    titulo_cache = tit
+                                    geo_cache = None
+                                    self._parar_processo()
+                                    self._iniciar_processo()
+                                    continue
+                            geo = geometria_janela(ref)
+                            if modo == "regiao" and geo and geo_cache and geo != geo_cache:
+                                log("janela moveu, ajustando captura",
+                                    "%(w)dx%(h)d+%(x)d+%(y)d" % geo)
                                 self._parar_processo()
                                 self._iniciar_processo()
-                                continue
-                        geo = geometria_janela(ref)
-                        if modo == "regiao" and geo and geo_cache and geo != geo_cache:
-                            log("janela moveu, ajustando captura",
-                                "%(w)dx%(h)d+%(x)d+%(y)d" % geo)
-                            self._parar_processo()
-                            self._iniciar_processo()
-                        if geo:
-                            geo_cache = geo
+                            if geo:
+                                geo_cache = geo
+                        else:
+                            # printwindow: so acompanha se a janela ainda existe
+                            titulo_cache = None
+                            geo_cache = None
             except Exception as e:
                 log("vigia da janela:", e)
 
@@ -1468,16 +2738,21 @@ class Captura:
                 "erro": self.erro,
                 "espectadores": len(self.assinantes),
                 "kbps": self.kbps_real,
+                "kbps_alvo": n["kbps"],
                 "segundos": int(time.time() - self.inicio) if self.inicio and self.deve_rodar else 0,
                 "rodando": self.deve_rodar,
                 "opcoes": dict(self.opcoes),
                 "qualidade": n["nome"],
                 "nivel": self.nivel,
                 "fps": n["fps"],
-                "dimensoes": self.dimensoes,
+                "dimensoes": "%dx%d" % (n["larg"], n["alt"]),
+                "niveis": [{"nome": x["nome"], "larg": x["larg"], "alt": x["alt"],
+                            "fps": x["fps"], "kbps": x["kbps"]} for x in NIVEIS],
                 "codificador": nomes_enc.get(self.codificador, self.codificador),
                 "velocidade": self.velocidade,
                 "aviso_nivel": self.aviso_nivel,
+                "atraso": self.atraso_atual(),
+                "atrasos": list(ATRASOS_OK),
                 "som": self.mesa.estado(),
                 "registro": list(self.registro[-6:]),
             }
@@ -1507,6 +2782,7 @@ class Adaptador:
                 log("adaptador:", e)
 
     def _avaliar(self):
+        # Nao troca qualidade sozinho: dono ou quem assiste escolhe no painel/viewer.
         cap = self.captura
         if not cap.deve_rodar or cap.estado != "no ar":
             self.motivo = "captura parada"
@@ -1514,21 +2790,15 @@ class Adaptador:
         quedas = cap.consumir_quedas()
         saude = self.ctx.saude()
         entupido = cap.congestionado()
+        qnome = NIVEIS[cap.nivel]["nome"]
         if quedas or saude == "apertado" or entupido:
             self.apertado += 1
             self.calmo_desde = time.time()
-            self.motivo = "apertado (quedas=%d, saude=%s, fila=%s)" % (
-                quedas, saude, entupido)
-            if self.apertado >= 2:
-                self.apertado = 0
-                cap.mudar_nivel(+1, "a conexão de quem assiste não estava dando conta")
+            self.motivo = "apertado (quedas=%d, saude=%s, fila=%s) em %s" % (
+                quedas, saude, entupido, qnome)
             return
         self.apertado = 0
-        self.motivo = "calmo (%s)" % saude
-        if saude in ("ok", "sem publico") and \
-                time.time() - self.calmo_desde > self.PACIENCIA:
-            self.calmo_desde = time.time()
-            cap.mudar_nivel(-1, "")
+        self.motivo = "calmo (%s) em %s" % (saude, qnome)
 
 
 class Tunel:
@@ -1572,18 +2842,34 @@ class Tunel:
             self.estado = "falhou"
 
     def parar(self):
-        if self.proc and self.proc.poll() is None:
-            try:
-                self.proc.terminate()
-                self.proc.wait(timeout=3)
-            except Exception:
-                try:
-                    self.proc.kill()
-                except Exception:
-                    pass
+        proc = self.proc
         self.proc = None
         self.url = ""
         self.estado = "desligado"
+        if not proc or proc.poll() is not None:
+            return
+        pid = proc.pid
+        try:
+            if IS_WINDOWS:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            else:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except Exception:
+                    proc.kill()
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            pass
 
 
 class Contexto:
@@ -1596,6 +2882,7 @@ class Contexto:
         self.chave_painel = secrets.token_urlsafe(12)
         self.porta_publica = 0
         self.porta_painel = 0
+        self.servidores = []
         self.visores = {}
         self.ultimo_ping = 0
         self.viu_painel = False
@@ -1612,12 +2899,24 @@ class Contexto:
             for k in PADRAO:
                 if k in salvo:
                     self.captura.opcoes[k] = salvo[k]
+            q = self.captura.opcoes.get("qualidade") or "1080p"
+            idx = self.captura._indice_qualidade(q)
+            if idx is not None:
+                self.captura.nivel = idx
+                self.captura.opcoes["qualidade"] = NIVEIS[idx]["nome"]
+            atraso = self.captura.opcoes.get("atraso", ATRASO_PADRAO)
+            try:
+                atraso = int(atraso)
+            except (TypeError, ValueError):
+                atraso = ATRASO_PADRAO
+            self.captura.opcoes["atraso"] = atraso if atraso in ATRASOS_OK else ATRASO_PADRAO
         except Exception:
             pass
 
     def salvar(self):
         try:
             os.makedirs(DIR_CACHE, exist_ok=True)
+            self.captura.opcoes["qualidade"] = NIVEIS[self.captura.nivel]["nome"]
             guardar = {k: v for k, v in self.captura.opcoes.items() if k != "alvo"}
             with open(ARQ_CONFIG, "w") as f:
                 json.dump(guardar, f)
@@ -1656,18 +2955,36 @@ class Contexto:
             saida.append("http://[%s]:%d/v/%s" % (ip, self.porta_publica, self.token))
         return saida
 
+    def liberar_portas(self):
+        for srv in list(self.servidores or []):
+            try:
+                srv.shutdown()
+            except Exception:
+                pass
+            try:
+                srv.server_close()
+            except Exception:
+                pass
+            try:
+                if getattr(srv, "socket", None):
+                    srv.socket.close()
+            except Exception:
+                pass
+        self.servidores = []
+
     def encerrar(self):
         if self.encerrando:
             return
         self.encerrando = True
-        log("encerrando")
+        log("encerrando: liberando tunel e portas")
         self.salvar()
-        for acao in (self.captura.parar, self.tunel.parar, self.mesa.limpar):
+        for acao in (self.captura.parar, self.tunel.parar, self.mesa.limpar,
+                     self.liberar_portas):
             try:
                 acao()
             except Exception:
                 pass
-        threading.Timer(0.6, lambda: os._exit(0)).start()
+        threading.Timer(0.4, lambda: os._exit(0)).start()
 
 
 # Páginas Web (HTML/JS)
@@ -1676,11 +2993,11 @@ PAGINA_BASE = """
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <style>
 :root{color-scheme:light dark;
---bg:#fbfbfa;--cx:#fff;--tx:#1a1a19;--mut:#6b6b68;--bd:#e3e3e0;
---ac:#2f6f4e;--er:#a3382f;--sel:#eef4f0}
+--bg:#f2f0eb;--cx:#f7f5f0;--tx:#2a2926;--mut:#6f6d68;--bd:#e0ddd6;
+--ac:#2f6f4e;--er:#a3382f;--sel:#e8efe9;--on:#f7f5f0}
 @media (prefers-color-scheme:dark){:root{
---bg:#131313;--cx:#1c1c1b;--tx:#ececea;--mut:#9a9a96;--bd:#2e2e2c;
---ac:#5fb98a;--er:#e0796d;--sel:#1e2a24}}
+--bg:#171715;--cx:#22221f;--tx:#ebe8e2;--mut:#9a9791;--bd:#34322e;
+--ac:#5fb98a;--er:#e0796d;--sel:#1e2a24;--on:#f2f0eb}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--tx);
 font:16px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
@@ -1696,7 +3013,7 @@ button:hover{border-color:var(--mut)}
 button:active{transform:scale(.96);background:var(--sel)}
 button:focus-visible,select:focus-visible,input:focus-visible{
 outline:2px solid var(--ac);outline-offset:2px}
-button.p{background:var(--ac);border-color:var(--ac);color:#fff;font-weight:500}
+button.p{background:var(--ac);border-color:var(--ac);color:var(--on);font-weight:500}
 button.p:hover{filter:brightness(1.08)}
 button[disabled]{opacity:.5;cursor:progress;transform:none}
 select,input[type=text]{background:var(--cx);border:1px solid var(--bd);
@@ -1716,12 +3033,12 @@ transition:background .2s}
 padding:16px;margin-bottom:14px}
 .lin{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .jn{max-height:420px;min-height:160px;overflow:auto;border:1px solid var(--bd);border-radius:9px}
-.jn div{padding:12px;cursor:pointer;border-bottom:1px solid var(--bd);
+.jn > div{padding:12px;cursor:pointer;border-bottom:1px solid var(--bd);
 display:flex;justify-content:space-between;gap:10px;align-items:center;
 transition:background .12s}
-.jn div:last-child{border-bottom:0}
-.jn div:hover{background:var(--sel)}
-.jn div.sel{background:var(--ac);color:#fff}
+.jn > div:last-child{border-bottom:0}
+.jn > div:hover{background:var(--sel)}
+.jn > div.sel{background:var(--ac);color:var(--on)}
 .jn small{opacity:.75;flex:none;font-size:12px}
 .jn span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
 .jn .meta{display:flex;flex-direction:column;gap:2px;min-width:0;flex:1}
@@ -1740,8 +3057,16 @@ pre{margin:8px 0 0;font-size:12px;color:var(--mut);white-space:pre-wrap;
 max-height:90px;overflow:auto}
 .mic{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .mic button{min-width:150px}
-.mic button.on{background:var(--ac);border-color:var(--ac);color:#fff}
+.mic button.on{background:var(--ac);border-color:var(--ac);color:var(--on)}
 .q{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+.qbtns{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+.qbtns button.sel{background:var(--ac);border-color:var(--ac);color:var(--on)}
+.cxstat{margin-top:8px;padding:10px 12px;border-radius:9px;border:1px solid var(--bd);background:var(--sel)}
+.cxstat.ok{border-color:#6a9a6a}
+.cxstat.apertado,.cxstat.erro{border-color:var(--er)}
+.cxstat.iniciando,.cxstat.aviso,.cxstat.pausado{border-color:#b89a4a}
+.cxstat b{display:block;margin-bottom:4px}
+.cxstat .mut{display:block}
 #msgs{max-height:190px;overflow:auto;display:flex;flex-direction:column;gap:7px;
 margin-bottom:10px}
 .msg{background:var(--bg);border:1px solid var(--bd);border-radius:9px;
@@ -1761,10 +3086,10 @@ padding:7px 11px;font-size:14.5px;animation:ap .2s ease}
     <h2>O que transmitir <span class="mut" id="contagem"></span></h2>
     <input type="search" id="busca-janela" placeholder="Buscar janela pelo nome..."
            autocomplete="off" oninput="filtrarJanelas()">
-    <div class="jn" id="jn"><div>Carregando janelas...</div></div>
+    <div class="jn" id="jn"><div>Abrindo lista...</div></div>
     <div class="lin" style="margin-top:10px">
       <button type="button" id="btn-atualizar" onclick="listar(true)">Atualizar lista</button>
-      <span class="mut">Clique na janela especifica (ou na tela inteira) e depois em Comecar.</span>
+      <span class="mut">Escolha a janela (ex.: VLC). Pode usar o PC normalmente (outras janelas na frente, sem foco): so nao feche a janela compartilhada. Qualidade e atraso voce define aqui; quem assiste so muda a qualidade se precisar.</span>
     </div>
   </div>
 
@@ -1779,13 +3104,20 @@ padding:7px 11px;font-size:14.5px;animation:ap .2s ease}
     <div class="mut" id="som-info"></div>
     <div class="mic" style="margin-top:12px">
       <button id="bmic" onclick="alternarMic(this)">Microfone desligado</button>
-      <select id="mic" style="flex:1;min-width:200px"></select>
+      <select id="mic" style="flex:1;min-width:220px" title="Escolha o microfone"
+        onchange="api('/api/opcoes',{microfone:this.value}).then(pintar)"></select>
+      <button type="button" id="btn-mics" onclick="atualizarMics(this)">Atualizar mics</button>
     </div>
   </div>
 
   <div class="cx">
-    <h2>Qualidade</h2>
+    <h2>Qualidade e conexao</h2>
+    <div class="qbtns" id="qbtns"></div>
+    <h2 style="margin-top:14px">Atraso da transmissao</h2>
+    <div class="mut" style="margin-bottom:8px">Voce escolhe. Quem assiste fica esse tempo atras do ao vivo, com buffer maior e menos travada.</div>
+    <div class="qbtns" id="atrasobtns"></div>
     <div class="q" id="q"></div>
+    <div class="cxstat" id="cxstat"></div>
   </div>
 
   <div class="cx">
@@ -1830,8 +3162,13 @@ function api(rota, corpo){
   return fetch(rota + sep + "k=" + encodeURIComponent(D.chave), {
     method: "POST",
     headers: {"Content-Type":"application/json"},
-    body: JSON.stringify(corpo === undefined ? {} : corpo)
-  }).then(r => r.json());
+    body: JSON.stringify(corpo === undefined ? {} : corpo),
+    cache: "no-store"
+  }).then(async r => {
+    const d = await r.json().catch(() => null);
+    if (!r.ok) throw new Error((d && d.erro) || ("http " + r.status));
+    return d;
+  });
 }
 
 function ocupado(btn, promessa){
@@ -1845,8 +3182,29 @@ function rotuloJanela(j){
   const tit = (j.titulo || "").trim();
   if (app && tit && tit.toLowerCase() !== app.toLowerCase()
       && !tit.toLowerCase().startsWith(app.toLowerCase()))
-    return app + " · " + tit;
+    return app + " - " + tit;
   return tit || app || "Janela";
+}
+
+function aplicarFontes(d){
+  if (!d || !Array.isArray(d.telas) || !Array.isArray(d.janelas)) return false;
+  const itens = [];
+  (d.telas || []).forEach(t => itens.push({v:"tela:"+t.nome, tipo:"tela",
+    t:"Tela inteira (" + (t.rotulo || t.nome) + ")", s:t.w + "x" + t.h, app:""}));
+  (d.janelas || []).forEach(j => itens.push({v:"janela:"+j.id, tipo:"janela",
+    t: rotuloJanela(j), app: j.app || "",
+    s:(j.minimizada ? "minimizada  " : "") + (j.w + "x" + j.h), min:!!j.minimizada}));
+  itensFontes = itens;
+  const cont = $("contagem");
+  if (cont) cont.textContent = "(" + (d.janelas || []).length + " janelas)";
+  assinaturas.jn = null;
+  pintarListaJanelas();
+  preencherMics(d.microfones || [], true);
+  if (d.microfone_atual && $("mic")){
+    const f = $("mic");
+    if ([...f.options].some(o => o.value === d.microfone_atual)) f.value = d.microfone_atual;
+  }
+  return itens.length > 0;
 }
 
 function pintarListaJanelas(){
@@ -1858,6 +3216,7 @@ function pintarListaJanelas(){
   jn.innerHTML = "";
   filtrados.forEach(it => {
     const el = document.createElement("div");
+    el.setAttribute("data-alvo", it.v);
     const meta = document.createElement("div");
     meta.className = "meta";
     const span = document.createElement("span");
@@ -1879,60 +3238,99 @@ function pintarListaJanelas(){
       [...jn.children].forEach(c => c.className = "");
       el.className = "sel";
       assinaturas.jn = null;
-      api("/api/opcoes", {alvo: alvo}).then(pintar);
+      api("/api/opcoes", {alvo: alvo}).then(pintar).catch(()=>{});
     };
     jn.appendChild(el);
   });
   if (!filtrados.length){
-    jn.innerHTML = q
-      ? "<div>Nenhuma janela com \"" + q.replace(/[<>&]/g, "") + "\"</div>"
-      : "<div>Nenhuma janela aberta. Abra o app e clique em Atualizar lista.</div>";
+    const msg = document.createElement("div");
+    msg.textContent = q
+      ? ('Nenhuma janela com "' + q + '"')
+      : "Nenhuma janela aberta. Abra o app e clique em Atualizar lista.";
+    jn.appendChild(msg);
   }
 }
 
 function filtrarJanelas(){ pintarListaJanelas(); }
 
-function listar(forcar){
+function listar(forcar, tentativa){
+  tentativa = tentativa || 1;
+  const jn = $("jn");
+  const btn = $("btn-atualizar");
+  if (forcar && btn && tentativa === 1){
+    btn.dataset.txt = btn.textContent;
+    btn.textContent = "Atualizando...";
+    btn.disabled = true;
+  }
   return api("/api/fontes", {}).then(d => {
-    if (!d || !Array.isArray(d.telas) || !Array.isArray(d.janelas)){
-      const jn = $("jn");
-      if (jn) jn.innerHTML = "<div>Nao consegui listar as janelas. Clique em Atualizar lista.</div>";
-      return;
+    if (btn && btn.dataset.txt){
+      btn.textContent = btn.dataset.txt;
+      btn.disabled = false;
     }
-    const itens = [];
-    d.telas.forEach(t => itens.push({v:"tela:"+t.nome, tipo:"tela",
-      t:"Tela inteira (" + (t.rotulo || t.nome) + ")", s:t.w + "x" + t.h, app:""}));
-    d.janelas.forEach(j => itens.push({v:"janela:"+j.id, tipo:"janela",
-      t: rotuloJanela(j), app: j.app || "",
-      s:(j.minimizada ? "minimizada  " : "") + (j.w + "x" + j.h), min:j.minimizada}));
-    itensFontes = itens;
-    const cont = $("contagem");
-    if (cont) cont.textContent = "(" + d.janelas.length + " janelas)";
-    const assina = JSON.stringify(itens.map(i => i.v + ":" + i.t)) + "|" + alvo;
-    if (forcar || assinaturas.jn !== assina){
-      assinaturas.jn = assina;
-      pintarListaJanelas();
-    }
-    const assinaM = JSON.stringify(d.microfones || []);
-    if (forcar || assinaturas.mic !== assinaM){
-      assinaturas.mic = assinaM;
-      const f = $("mic"); const antes = f.value || D.opcoes.microfone;
-      f.innerHTML = "";
-      if (!(d.microfones || []).length){
-        const o = document.createElement("option");
-        o.value = ""; o.textContent = "nenhum microfone encontrado";
-        f.appendChild(o);
+    if (!aplicarFontes(d)){
+      if (tentativa < 4)
+        return new Promise(r => setTimeout(r, 300 * tentativa)).then(() => listar(forcar, tentativa + 1));
+      if (jn && !itensFontes.length){
+        jn.innerHTML = "";
+        const msg = document.createElement("div");
+        msg.textContent = "Nao consegui listar. Clique em Atualizar lista.";
+        jn.appendChild(msg);
       }
-      (d.microfones || []).forEach(m => {
-        const o = document.createElement("option");
-        o.value = m.nome; o.textContent = m.rotulo; f.appendChild(o);
-      });
-      if ([...f.options].some(o => o.value === antes)) f.value = antes;
     }
   }).catch(() => {
-    const jn = $("jn");
-    if (jn) jn.innerHTML = "<div>Falha ao carregar a lista. Clique em Atualizar lista.</div>";
+    if (tentativa < 4)
+      return new Promise(r => setTimeout(r, 300 * tentativa)).then(() => listar(forcar, tentativa + 1));
+    if (btn && btn.dataset.txt){
+      btn.textContent = btn.dataset.txt;
+      btn.disabled = false;
+    }
+    if (jn && !itensFontes.length){
+      jn.innerHTML = "";
+      const msg = document.createElement("div");
+      msg.textContent = "Falha ao carregar. Clique em Atualizar lista.";
+      jn.appendChild(msg);
+    }
   });
+}
+
+function preencherMics(lista, forcar){
+  const f = $("mic");
+  if (!f) return;
+  const atuais = [...f.options].map(o => o.value).filter(Boolean);
+  // Nao apaga a lista boa se uma leitura veio vazia.
+  if (!(lista || []).length){
+    if (!atuais.length){
+      f.innerHTML = "";
+      const o = document.createElement("option");
+      o.value = ""; o.textContent = "nenhum microfone encontrado";
+      f.appendChild(o);
+    }
+    return;
+  }
+  const assinaM = JSON.stringify(lista.map(m => m.nome));
+  if (!forcar && assinaturas.mic === assinaM && f.options.length) return;
+  assinaturas.mic = assinaM;
+  let antes = f.value || (D.opcoes && D.opcoes.microfone) || "";
+  const wireless = lista.find(m => /wireless|sem fio/i.test(m.nome || ""));
+  if (!antes && wireless) antes = wireless.nome;
+  if (!antes) antes = lista[0].nome;
+  f.innerHTML = "";
+  lista.forEach(m => {
+    const o = document.createElement("option");
+    o.value = m.nome;
+    o.textContent = m.rotulo || m.nome;
+    f.appendChild(o);
+  });
+  if ([...f.options].some(o => o.value === antes)) f.value = antes;
+  else if (f.options.length) f.selectedIndex = 0;
+  if (f.value && (!(D.opcoes && D.opcoes.microfone) || D.opcoes.microfone !== f.value))
+    api("/api/opcoes", {microfone: f.value}).then(e => { if (e) pintar(e); }).catch(()=>{});
+}
+
+function atualizarMics(btn){
+  return ocupado(btn, api("/api/fontes", {atualizar_mics: true}).then(d => {
+    preencherMics((d && d.microfones) || [], true);
+  }));
 }
 
 function alternarMic(btn){
@@ -1992,7 +3390,9 @@ function pintarLinks(){
   const assina = est.url_publica + "|" + (est.urls_diretas||[]).join("|") + "|" + est.tunel;
   if (assinaturas.links === assina) return;
   assinaturas.links = assina;
-  const t = $("tunel"); t.innerHTML = "";
+  const t = $("tunel");
+  if (!t) return;
+  t.innerHTML = "";
   const m = document.createElement("div");
   m.className = "mut";
   if (est.url_publica){
@@ -2017,6 +3417,7 @@ function pintarLinks(){
     t.appendChild(m);
   }
   const dd = $("diretos");
+  if (!dd) return;
   dd.innerHTML = "";
   const m2 = document.createElement("div");
   m2.className = "mut"; m2.style.marginTop = "14px";
@@ -2029,6 +3430,7 @@ function pintarProblemas(){
   if (assinaturas.problemas) return;
   assinaturas.problemas = true;
   const cx = $("problemas");
+  if (!cx) return;
   (est.problemas || []).forEach(p => {
     const d = document.createElement("div");
     d.className = "aviso";
@@ -2043,53 +3445,135 @@ function pintarProblemas(){
 
 function pintar(e){
   if (e) est = e;
-  if (!est.opcoes) return;
+  if (!est || !est.opcoes) return;
   if (!alvo && est.opcoes.alvo) alvo = est.opcoes.alvo;
-  pintarProblemas();
-  pintarLinks();
+  try { pintarProblemas(); } catch (err) {}
+  try { pintarLinks(); } catch (err) {}
 
-  $("pt").className = "pt" + (est.estado === "no ar" ? " on" :
+  const pt = $("pt");
+  if (pt) pt.className = "pt" + (est.estado === "no ar" ? " on" :
     (est.estado === "erro" ? " er" : ""));
-  $("btn").textContent = est.rodando ? "Parar" : "Comecar";
+  const btnMain = $("btn");
+  if (btnMain) btnMain.textContent = est.rodando ? "Parar" : "Comecar";
 
   const vs = est.visores || [];
   const tocando = vs.filter(x => x.tocando).length;
-  let quem = est.espectadores + " conectado(s)";
+  let quem = (est.espectadores || 0) + " conectado(s)";
   if (tocando) quem = tocando + " assistindo, " +
     Math.round(Math.max(...vs.map(x => x.buffer)) * 10) / 10 + "s de folga";
-  $("status").textContent = est.estado + (est.rodando ? "  |  " + quem : "");
-  $("resumo").textContent = est.rodando ?
-    "no ar ha " + Math.floor(est.segundos/60) + " min" : "";
+  const status = $("status");
+  if (status) status.textContent = (est.estado || "") + (est.rodando ? "  |  " + quem : "");
+  const resumo = $("resumo");
+  if (resumo) resumo.textContent = est.rodando ?
+    "no ar ha " + Math.floor((est.segundos || 0)/60) + " min" : "";
+
+  const qbtns = $("qbtns");
+  if (qbtns){
+    const niveis = est.niveis || [
+      {nome:"480p", larg:854, alt:480, fps:30, kbps:1500},
+      {nome:"720p", larg:1280, alt:720, fps:30, kbps:4500},
+      {nome:"1080p", larg:1920, alt:1080, fps:30, kbps:12000}
+    ];
+    qbtns.innerHTML = "";
+    niveis.forEach(n => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.textContent = n.nome + " 30fps";
+      if ((est.qualidade || "") === n.nome) b.className = "sel";
+      b.title = n.larg + "x" + n.alt + " ~" + Math.round(n.kbps/1000) + " Mbps";
+      b.onclick = () => ocupado(b, api("/api/qualidade", {qualidade: n.nome}).then(pintar));
+      qbtns.appendChild(b);
+    });
+  }
+
+  const abtns = $("atrasobtns");
+  if (abtns){
+    const opcoes = est.atrasos || [3, 6, 10];
+    const atual = est.atraso || 6;
+    abtns.innerHTML = "";
+    opcoes.forEach(sec => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.textContent = sec + " segundos";
+      if (Number(atual) === Number(sec)) b.className = "sel";
+      b.title = "Quem assiste fica cerca de " + sec + "s atras do ao vivo";
+      b.onclick = () => ocupado(b, api("/api/atraso", {atraso: sec}).then(pintar));
+      abtns.appendChild(b);
+    });
+  }
 
   const q = $("q");
-  q.innerHTML = "";
-  const b = document.createElement("b");
-  b.textContent = est.qualidade + (est.dimensoes ? " (" + est.dimensoes + ")" : "");
-  q.appendChild(b);
-  const det = document.createElement("span");
-  det.className = "mut";
-  det.textContent = est.fps + " fps  |  " + est.kbps + " kbps  |  comprimindo pela " +
-    est.codificador + (est.velocidade ? "  |  " + est.velocidade : "");
-  q.appendChild(det);
-  if (est.aviso_nivel){
-    const a = document.createElement("span");
-    a.className = "er"; a.textContent = est.aviso_nivel;
-    q.appendChild(a);
+  if (q){
+    q.innerHTML = "";
+    const b = document.createElement("b");
+    b.textContent = (est.qualidade || "?") + " " + (est.fps || 30) + "fps"
+      + (est.dimensoes ? " (" + est.dimensoes + ")" : "")
+      + " · atraso " + (est.atraso || 6) + "s";
+    q.appendChild(b);
+    const det = document.createElement("span");
+    det.className = "mut";
+    const enviando = (est.kbps || 0);
+    const alvo = (est.kbps_alvo || 0);
+    det.textContent = "enviando " + enviando + " kbps (~"
+      + (Math.round(enviando/100)/10) + " Mbps)  |  alvo ~"
+      + Math.round(alvo/1000) + " Mbps  |  "
+      + (est.codificador || "")
+      + (est.velocidade ? "  |  encode " + est.velocidade : "");
+    q.appendChild(det);
+  }
+
+  const cx = $("cxstat");
+  if (cx){
+    const c = est.conexao || {};
+    const st = c.status || (est.rodando ? "aviso" : "parado");
+    cx.className = "cxstat " + st;
+    const tit = document.createElement("b");
+    const rotulo = {
+      ok: "Conexao ok",
+      apertado: "Conexao apertada",
+      erro: "Nao esta transmitindo",
+      iniciando: "Iniciando...",
+      pausado: "Pausado",
+      parado: "Parado",
+      aviso: "Aguardando"
+    }[st] || st;
+    tit.textContent = rotulo;
+    const det = document.createElement("span");
+    det.className = "mut";
+    det.textContent = c.detalhe || "";
+    const extra = document.createElement("span");
+    extra.className = "mut";
+    const esp = (est.espectadores || 0);
+    extra.textContent = esp
+      ? (esp + " assistindo agora")
+      : (est.rodando ? "Link no ar; aguardando quem assiste" : "");
+    cx.innerHTML = "";
+    cx.appendChild(tit);
+    if (det.textContent) cx.appendChild(det);
+    if (extra.textContent) cx.appendChild(extra);
   }
 
   const s = est.som || {};
   const info = $("som-info");
-  if (!est.opcoes.alvo) info.textContent = "Escolha uma janela acima.";
-  else info.textContent = "Transmitindo áudio direto do Windows.";
+  if (info){
+    if (!est.opcoes.alvo) info.textContent = "Escolha uma janela acima.";
+    else if (s.programa) info.textContent = "Som: " + s.programa +
+      ". Quem assiste ouve o que sai nas suas caixas (VLC, Chrome, etc.).";
+    else info.textContent = "Transmitindo audio do sistema.";
+  }
 
   const bm = $("bmic");
-  const ligado = est.opcoes.mic_ligado;
-  bm.className = ligado ? "on" : "";
-  bm.textContent = ligado ? (s.mic_no_ar ? "Microfone no ar" : "Ligando microfone...")
-                          : "Microfone desligado";
+  if (bm){
+    const ligado = !!est.opcoes.mic_ligado;
+    bm.className = ligado ? "on" : "";
+    bm.textContent = ligado ? (s.mic_no_ar ? "Microfone no ar" : "Ligando microfone...")
+                            : "Microfone desligado";
+  }
 
-  $("erro").textContent = est.erro || "";
-  $("reg").textContent = (est.registro || []).join(String.fromCharCode(10));
+  const er = $("erro");
+  if (er) er.textContent = est.erro || "";
+  const reg = $("reg");
+  if (reg) reg.textContent = (est.registro || []).join(String.fromCharCode(10));
 }
 
 function adicionar(m){
@@ -2139,25 +3623,41 @@ function mandar(btn){
     else $("chat-aviso").textContent = d.erro + (d.espera ? " (" + d.espera + "s)" : "");
   }));
 }
-$("texto").addEventListener("keydown", ev => {
-  if (ev.key === "Enter") mandar();
-});
-$("apelido").addEventListener("keydown", ev => {
-  if (ev.key === "Enter") salvarNomePainel();
-});
-const nomeSalvo = localStorage.getItem("tp_apelido") || "";
-$("apelido").value = nomeSalvo;
-if (nomeSalvo.trim().length >= 2){
-  $("chat-gate").style.display = "none";
-  $("chat-form").style.display = "flex";
-}
+try {
+  const elTexto = $("texto");
+  if (elTexto) elTexto.addEventListener("keydown", ev => {
+    if (ev.key === "Enter") mandar();
+  });
+  const elApelido = $("apelido");
+  if (elApelido){
+    elApelido.addEventListener("keydown", ev => {
+      if (ev.key === "Enter") salvarNomePainel();
+    });
+    const nomeSalvo = localStorage.getItem("tp_apelido") || "";
+    elApelido.value = nomeSalvo;
+    if (nomeSalvo.trim().length >= 2){
+      const gate = $("chat-gate");
+      const form = $("chat-form");
+      if (gate) gate.style.display = "none";
+      if (form) form.style.display = "flex";
+    }
+  }
+} catch (e) {}
 
+// Lista ja vem no HTML (D.fontes). Pinta na hora, depois atualiza via API.
+try {
+  if (D && D.opcoes && D.opcoes.alvo) alvo = D.opcoes.alvo;
+  if (D && D.fontes) aplicarFontes(D.fontes);
+} catch (e) {
+  const jn = $("jn");
+  if (jn) jn.textContent = "Erro ao montar lista inicial. Clique em Atualizar lista.";
+}
 listar(true);
-api("/api/estado", {}).then(pintar);
-setInterval(() => api("/api/estado", {}).then(pintar), 2000);
+api("/api/estado", {}).then(pintar).catch(()=>{});
+setInterval(() => api("/api/estado", {}).then(pintar).catch(()=>{}), 2000);
 setInterval(() => listar(false), 10000);
 setInterval(puxarChat, 2000);
-setInterval(() => api("/api/ping", {}), 5000);
+setInterval(() => api("/api/ping", {}).catch(()=>{}), 5000);
 // Nao mata o servidor ao trocar de aba (pagehide no Chrome dispara demais).
 // Use o botao Encerrar, ou feche a janela do terminal/atalho.
 </script>
@@ -2166,85 +3666,218 @@ setInterval(() => api("/api/ping", {}), 5000);
 PAGINA_VISOR = PAGINA_BASE + """
 <title>Transmissao ao vivo</title>
 <style>
-html,body{height:100%;margin:0;background:#0c0c0c;color:#eee;overflow:hidden}
-body{display:flex;height:100%}
-#palco{flex:1;min-width:0;position:relative;background:#111;display:flex;
-align-items:center;justify-content:center}
-video{width:100%;height:100%;object-fit:contain;background:#111}
-#chat{width:min(340px,100%);max-width:100%;height:100%;display:flex;flex-direction:column;
-background:#141414;border-left:1px solid #2a2a2a;z-index:4;flex:none}
-#chat h2{margin:0;padding:14px 16px 10px;font-size:13px;letter-spacing:.06em;
-text-transform:uppercase;color:#9a9a96;border-bottom:1px solid #2a2a2a}
-#lista{flex:1;overflow:auto;padding:12px;display:flex;flex-direction:column;gap:8px}
-#lista .msg{background:#1c1c1b;border:1px solid #2e2e2c;border-radius:10px;
-padding:8px 11px;font-size:14.5px;word-break:break-word;animation:ap .2s ease}
-#lista .msg b{color:#5fb98a;margin-right:6px}
-#lista .msg.saindo{opacity:0;transition:opacity .8s}
-@keyframes ap{from{opacity:0;transform:translateY(6px)}to{opacity:1}}
-#gate,#form{padding:12px 14px 16px;border-top:1px solid #2a2a2a;display:flex;
-flex-direction:column;gap:8px}
-#gate input,#form input{background:#1c1c1b;border:1px solid #2e2e2c;color:#fff;
-border-radius:9px;padding:11px 13px;min-height:44px;width:100%}
-#gate button,#form button{background:#5fb98a;color:#0c0c0c;border:0;border-radius:9px;
-padding:12px 16px;font-weight:600;min-height:44px;cursor:pointer}
+html,body{height:100%;margin:0;background:#0e0e10;color:#efeff1;overflow:hidden;
+font-family:Inter,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+#shell{display:flex;width:100%;height:100%;min-height:0}
+#palco{position:relative;flex:1;min-width:0;min-height:0;background:#000;
+display:flex;align-items:center;justify-content:center}
+video{width:100%;height:100%;object-fit:contain;background:#000}
+#espera{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;
+justify-content:center;gap:12px;background:#000;text-align:center;padding:28px;z-index:2}
+#espera.ok{display:none}
+#espera .t{font-size:20px;font-weight:600}
+#espera .s{font-size:14.5px;color:#adadb8;max-width:360px;line-height:1.45}
+#barra{position:absolute;left:0;right:0;bottom:0;z-index:4;padding:14px 16px 18px;display:flex;
+gap:10px;flex-wrap:wrap;align-items:center;justify-content:center;
+background:linear-gradient(transparent,#000000e6 55%);opacity:0;pointer-events:none;
+transition:opacity .25s}
+#barra.on{opacity:1;pointer-events:auto}
+#barra button,#barra select{background:#18181bcc;color:#efeff1;border:1px solid #ffffff22;
+border-radius:4px;padding:10px 14px;font-size:14px;backdrop-filter:blur(8px);
+min-height:42px;cursor:pointer}
+#barra select{appearance:auto;padding-right:28px}
+#barra .vol{display:flex;align-items:center;gap:8px;background:#18181bcc;
+border:1px solid #ffffff22;border-radius:4px;padding:6px 12px;
+backdrop-filter:blur(8px);min-height:42px}
+#barra .vol input[type=range]{width:110px;accent-color:#9147ff}
+#barra .vol span{font-size:13px;min-width:2.5em;text-align:center;opacity:.9}
+#barra #bchat.ligado{background:#9147ff;border-color:#9147ff;color:#fff;font-weight:600}
+#aviso{position:absolute;top:14px;left:50%;transform:translateX(-50%);background:#18181bcc;
+padding:8px 15px;border-radius:4px;font-size:13px;opacity:0;transition:.3s;
+pointer-events:none;backdrop-filter:blur(6px);z-index:6}
+#aviso.on{opacity:1}
+/* Chat estilo Twitch: coluna lateral, usuario abre/fecha. Nao some com a barra. */
+#chat{width:340px;flex:none;display:flex;flex-direction:column;min-height:0;
+background:#18181b;border-left:1px solid #2f2f35;transform:translateX(0);
+transition:width .2s ease, margin .2s ease, opacity .2s ease, transform .2s ease}
+#chat.fechado{width:0;margin:0;border:0;opacity:0;overflow:hidden;pointer-events:none}
+#chat-cab{display:flex;align-items:center;justify-content:space-between;gap:8px;
+padding:10px 12px;border-bottom:1px solid #2f2f35;flex:none}
+#chat-cab h2{margin:0;font-size:13px;font-weight:600;letter-spacing:.04em;
+text-transform:uppercase;color:#efeff1}
+#chat-cab button{background:transparent;border:0;color:#adadb8;cursor:pointer;
+font-size:18px;line-height:1;padding:4px 8px;border-radius:4px}
+#chat-cab button:hover{background:#2f2f35;color:#efeff1}
+#lista{flex:1;overflow:auto;padding:10px 12px;display:flex;flex-direction:column;
+gap:6px;min-height:0}
+#lista .msg{font-size:13.5px;line-height:1.35;word-break:break-word;padding:2px 0;
+color:#efeff1}
+#lista .msg b{color:#9147ff;margin-right:6px;font-weight:700}
+#lista .msg.sys{color:#adadb8;font-size:12.5px}
+#gate,#form{padding:10px 12px 12px;border-top:1px solid #2f2f35;display:flex;
+flex-direction:column;gap:8px;flex:none;background:#18181b}
+#gate input,#form input{background:#0e0e10;border:1px solid #2f2f35;color:#efeff1;
+border-radius:4px;padding:10px 12px;min-height:40px;width:100%}
+#gate input:focus,#form input:focus{outline:1px solid #9147ff;border-color:#9147ff}
+#gate button,#form button{background:#9147ff;color:#fff;border:0;border-radius:4px;
+padding:10px 14px;font-weight:600;min-height:40px;cursor:pointer}
 #form .lin{display:flex;gap:8px}
 #form .lin input{flex:1}
 #form button{flex:none}
-#chat-aviso{font-size:12.5px;color:#e0796d;min-height:1.2em}
-#espera{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;
-justify-content:center;gap:12px;background:#111;text-align:center;padding:28px;z-index:2}
-#espera.ok{display:none}
-#espera .t{font-size:20px;font-weight:600}
-#espera .s{font-size:14.5px;color:#9a9a96;max-width:360px;line-height:1.45}
-#barra{position:absolute;top:0;right:0;padding:12px;display:flex;gap:8px;z-index:3;
-opacity:0;transition:opacity .25s}
-#barra.on{opacity:1}
-#barra button{background:#000a;color:#fff;border:1px solid #fff3;border-radius:999px;
-padding:11px 18px;font-size:14px;backdrop-filter:blur(8px);min-height:44px}
-#aviso{position:absolute;top:14px;left:50%;transform:translateX(-50%);background:#000a;
-padding:8px 15px;border-radius:999px;font-size:13px;opacity:0;transition:.3s;
-pointer-events:none;backdrop-filter:blur(6px);z-index:6}
-#aviso.on{opacity:1}
+#chat-aviso,#chat-aviso2{font-size:12.5px;color:#eb0400;min-height:1.1em}
+#chat-meta{font-size:12px;color:#adadb8}
 @media (max-width:800px){
-  body{flex-direction:column}
+  #shell{flex-direction:column}
   #palco{flex:1;min-height:42vh}
-  #chat{width:100%;height:min(48vh,420px);border-left:0;border-top:1px solid #2a2a2a}
+  #chat{width:100%;height:min(42vh,380px);border-left:0;border-top:1px solid #2f2f35}
+  #chat.fechado{width:100%;height:0;border:0}
 }
+/* Tela cheia: video ocupa tudo; chat e painel flutuante a direita, so se aberto. */
+body.fs #shell{display:block}
+body.fs #palco{width:100%;height:100%}
+body.fs #chat{position:fixed;top:0;right:0;bottom:0;width:min(360px,92vw);height:auto;
+z-index:8;box-shadow:-8px 0 24px #0008;border-left:1px solid #2f2f35;
+transform:translateX(0)}
+body.fs #chat.fechado{transform:translateX(110%);width:min(360px,92vw);opacity:1;
+pointer-events:none;margin:0;border-left:1px solid #2f2f35}
 </style>
-<div id="palco">
-  <video id="v" playsinline></video>
-  <div id="espera">
-    <div class="t">Aguardando a transmissao</div>
-    <div class="s" id="espera-msg">O anfitriao ainda nao clicou em Comecar.
-      Esta pagina atualiza sozinha.</div>
-  </div>
-  <div id="barra"><button id="bfs" type="button" onclick="telaCheia()">Tela cheia</button></div>
-  <div id="aviso"></div>
-</div>
-<aside id="chat">
-  <h2>Chat</h2>
-  <div id="lista"></div>
-  <div id="gate">
-    <div class="s" style="color:#9a9a96;font-size:13.5px">Escolha um nome para participar do chat.</div>
-    <input type="text" id="nome-novo" placeholder="seu nome" maxlength="20" autocomplete="nickname">
-    <button type="button" id="btn-nome" onclick="salvarNome()">Entrar no chat</button>
-    <div id="chat-aviso"></div>
-  </div>
-  <div id="form" style="display:none">
-    <div class="mut" style="font-size:12.5px;color:#9a9a96">Enviando como <b id="nome-ativo"></b>
-      · max. 1 msg / 5 s</div>
-    <div class="lin">
-      <input type="text" id="texto" placeholder="escreva uma mensagem" maxlength="200">
-      <button type="button" onclick="mandar()">Enviar</button>
+<div id="shell">
+  <div id="palco">
+    <video id="v" playsinline></video>
+    <div id="espera">
+      <div class="t">Aguardando a transmissao</div>
+      <div class="s" id="espera-msg">O anfitriao ainda nao clicou em Comecar.
+        Esta pagina atualiza sozinha.</div>
     </div>
-    <div id="chat-aviso2" class="s" style="color:#e0796d;font-size:12.5px;min-height:1.2em"></div>
+    <div id="aviso"></div>
+    <div id="barra">
+      <div class="vol">
+        <button type="button" id="bmute" onclick="alternarMudo()">Som</button>
+        <button type="button" onclick="mudarVol(-0.1)">-</button>
+        <input type="range" id="vol" min="0" max="100" value="100" oninput="setVol(this.value/100)">
+        <button type="button" onclick="mudarVol(0.1)">+</button>
+        <span id="vollbl">100%</span>
+      </div>
+      <select id="bq" onchange="pedirQualidade(this.value)" title="Qualidade">
+        <option value="1080p">1080p</option>
+        <option value="720p">720p</option>
+        <option value="480p">480p</option>
+      </select>
+      <button type="button" id="bchat" onclick="alternarChat()">Chat</button>
+      <button id="bfs" type="button" onclick="telaCheia()">Tela cheia</button>
+    </div>
   </div>
-</aside>
+  <aside id="chat" class="aberto" aria-label="Chat">
+    <div id="chat-cab">
+      <h2>Chat da transmissao</h2>
+      <button type="button" id="bchat-x" onclick="fecharChat()" title="Ocultar chat">×</button>
+    </div>
+    <div id="lista"></div>
+    <div id="gate">
+      <div class="s" style="color:#adadb8;font-size:13px">Escolha um nome para participar.</div>
+      <input type="text" id="nome-novo" placeholder="seu nome" maxlength="20" autocomplete="nickname">
+      <button type="button" id="btn-nome" onclick="salvarNome()">Entrar no chat</button>
+      <div id="chat-aviso"></div>
+    </div>
+    <div id="form" style="display:none">
+      <div id="chat-meta">Enviando como <b id="nome-ativo"></b> · max. 1 msg / 5 s</div>
+      <div class="lin">
+        <input type="text" id="texto" placeholder="Enviar uma mensagem" maxlength="200">
+        <button type="button" onclick="mandar()">Chat</button>
+      </div>
+      <div id="chat-aviso2"></div>
+    </div>
+  </aside>
+</div>
 <script>
 const T = location.pathname.split("/").pop();
 const v = document.getElementById("v");
 const MS = window.ManagedMediaSource || window.MediaSource;
 let ms, sb, fila = [], ativo = true, ultimoChat = 0, conectando = false, meuNome = "";
+let volSalvo = 1;
+// Atraso definido pelo host (padrao 6s). Quem assiste nao escolhe.
+let ATRASO = 6;
+let prontoParaTocar = false;
+let sumirBarra = null;
+let chatAberto = true;
+
+function emTelaCheia(){
+  return !!(document.fullscreenElement || document.webkitFullscreenElement);
+}
+function lerChatPref(){
+  try{
+    const s = localStorage.getItem("tp_chat");
+    if (s === "0") return false;
+    if (s === "1") return true;
+  }catch(e){}
+  // Fora de FS: aberto. Em FS: fechado por padrao (video limpo).
+  return !emTelaCheia();
+}
+function salvarChatPref(aberto){
+  try{ localStorage.setItem("tp_chat", aberto ? "1" : "0"); }catch(e){}
+}
+function aplicarChat(){
+  const chat = document.getElementById("chat");
+  const btn = document.getElementById("bchat");
+  chat.className = chatAberto ? "aberto" : "fechado";
+  if (btn){
+    btn.textContent = chatAberto ? "Ocultar chat" : "Chat";
+    btn.className = chatAberto ? "ligado" : "";
+  }
+}
+function abrirChat(){
+  chatAberto = true;
+  salvarChatPref(true);
+  aplicarChat();
+  mostrarBarra();
+}
+function fecharChat(){
+  chatAberto = false;
+  salvarChatPref(false);
+  aplicarChat();
+  mostrarBarra();
+}
+function alternarChat(){
+  if (chatAberto) fecharChat();
+  else abrirChat();
+}
+function mostrarBarra(){
+  const barra = document.getElementById("barra");
+  barra.className = "on";
+  clearTimeout(sumirBarra);
+  const ae = document.activeElement;
+  // So segura a barra se estiver mexendo nela (nao no chat).
+  const naBarra = ae && barra.contains(ae);
+  sumirBarra = setTimeout(() => {
+    if (naBarra || (document.activeElement && barra.contains(document.activeElement))){
+      mostrarBarra();
+      return;
+    }
+    barra.className = "";
+  }, emTelaCheia() ? 2600 : 3200);
+}
+function esconderBarra(){
+  document.getElementById("barra").className = "";
+}
+function mostrarUI(){ mostrarBarra(); }
+
+function aplicarAtrasoHost(sec){
+  const n = parseInt(sec, 10);
+  if ([3, 6, 10].indexOf(n) < 0 || n === ATRASO) return;
+  ATRASO = n;
+  prontoParaTocar = false;
+  aviso("Atraso do anfitriao: " + n + "s");
+  setTimeout(() => aviso(""), 1600);
+  alinhar(true);
+}
+
+function folga(){
+  try{
+    const b = v.buffered;
+    if (!b.length) return 0;
+    return b.end(b.length - 1) - v.currentTime;
+  }catch(e){ return 0; }
+}
 
 function aviso(t){
   const a = document.getElementById("aviso");
@@ -2258,6 +3891,55 @@ function mostrarEspera(msg){
 function esconderEspera(){
   document.getElementById("espera").className = "ok";
 }
+
+function setVol(x){
+  x = Math.max(0, Math.min(1, Number(x) || 0));
+  v.volume = x;
+  if (x > 0.001){ v.muted = false; volSalvo = x; }
+  const r = document.getElementById("vol");
+  if (r) r.value = Math.round(x * 100);
+  const lbl = document.getElementById("vollbl");
+  if (lbl) lbl.textContent = Math.round(x * 100) + "%";
+  const bm = document.getElementById("bmute");
+  if (bm) bm.textContent = (v.muted || x < 0.001) ? "Mudo" : "Som";
+  try{ localStorage.setItem("tp_vol", String(x)); }catch(e){}
+}
+function mudarVol(delta){ setVol((v.muted ? 0 : v.volume) + delta); mostrarBarra(); }
+function alternarMudo(){
+  if (v.muted || v.volume < 0.001){
+    v.muted = false;
+    setVol(volSalvo > 0.05 ? volSalvo : 0.7);
+  } else {
+    volSalvo = v.volume || volSalvo;
+    v.muted = true;
+    const bm = document.getElementById("bmute");
+    if (bm) bm.textContent = "Mudo";
+  }
+  mostrarBarra();
+}
+function pedirQualidade(nome){
+  fetch("/qualidade?t=" + encodeURIComponent(T), {
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({qualidade: nome})
+  }).then(r => r.json()).then(d => {
+    if (d && d.ok === false) aviso(d.erro || "Nao foi possivel mudar a qualidade");
+    else {
+      aviso("Qualidade: " + (nome || ""));
+      if (d && d.atraso) aplicarAtrasoHost(d.atraso);
+    }
+    setTimeout(() => aviso(""), 1800);
+  }).catch(() => aviso("Falha ao pedir qualidade"));
+  mostrarBarra();
+}
+function atualizarQualidadeUI(nome){
+  const s = document.getElementById("bq");
+  if (s && nome && [...s.options].some(o => o.value === nome)) s.value = nome;
+}
+try{
+  const vs = parseFloat(localStorage.getItem("tp_vol") || "1");
+  setVol(isFinite(vs) ? vs : 1);
+}catch(e){ setVol(1); }
 
 function atualizarGate(){
   meuNome = (localStorage.getItem("tp_apelido") || "").trim();
@@ -2280,12 +3962,13 @@ function salvarNome(){
   av.textContent = "";
   atualizarGate();
   document.getElementById("texto").focus();
+  abrirChat();
 }
 
 async function telaCheia(){
   try{
-    if (!document.fullscreenElement && !document.webkitFullscreenElement){
-      const alvo = document.getElementById("palco");
+    if (!emTelaCheia()){
+      const alvo = document.documentElement;
       if (alvo.requestFullscreen) await alvo.requestFullscreen({navigationUI:"hide"});
       else if (alvo.webkitRequestFullscreen) alvo.webkitRequestFullscreen();
       else if (v.webkitEnterFullscreen){ v.webkitEnterFullscreen(); return; }
@@ -2297,30 +3980,59 @@ async function telaCheia(){
     }
   }catch(e){}
   atualizarBotao();
+  mostrarBarra();
 }
 function atualizarBotao(){
-  const cheio = !!(document.fullscreenElement || document.webkitFullscreenElement);
+  const cheio = emTelaCheia();
+  const estavaFs = document.body.classList.contains("fs");
+  document.body.classList.toggle("fs", cheio);
   document.getElementById("bfs").textContent = cheio ? "Sair da tela cheia" : "Tela cheia";
+  // Entra em tela cheia: video limpo (chat fechado). Nao grava preferencia.
+  // Usuario abre de novo pelo botao Chat; ai fica ate ele fechar.
+  if (cheio && !estavaFs){
+    chatAberto = false;
+    aplicarChat();
+  }
+  if (!cheio && estavaFs){
+    chatAberto = lerChatPref();
+    aplicarChat();
+  }
 }
-document.addEventListener("fullscreenchange", atualizarBotao);
-document.addEventListener("webkitfullscreenchange", atualizarBotao);
+document.addEventListener("fullscreenchange", () => { atualizarBotao(); mostrarBarra(); });
+document.addEventListener("webkitfullscreenchange", () => { atualizarBotao(); mostrarBarra(); });
 
 let ultimoToque = 0;
+let ultimoMoveUI = 0;
 v.addEventListener("click", () => {
+  if (v.paused) v.play().catch(()=>{});
+  if (v.muted){ v.muted = false; setVol(volSalvo > 0.05 ? volSalvo : 1); }
   const agora = Date.now();
   if (agora - ultimoToque < 350) telaCheia();
   ultimoToque = agora;
   mostrarBarra();
 });
-let sumir;
-function mostrarBarra(){
-  const b = document.getElementById("barra");
-  b.className = "on";
-  clearTimeout(sumir);
-  sumir = setTimeout(() => b.className = "", 3500);
+function atividadeUI(e){
+  const agora = Date.now();
+  if (agora - ultimoMoveUI < 120) return;
+  ultimoMoveUI = agora;
+  const alvo = e && e.target;
+  if (alvo && alvo.closest && alvo.closest("#chat")) return; // chat nao mexe na barra
+  if (emTelaCheia()){ mostrarBarra(); return; }
+  if (!alvo) return;
+  if (alvo.closest && (alvo.closest("#palco") || alvo.closest("#barra"))) mostrarBarra();
 }
-document.addEventListener("mousemove", mostrarBarra);
-document.addEventListener("touchstart", mostrarBarra, {passive:true});
+document.addEventListener("mousemove", atividadeUI, {passive:true});
+document.addEventListener("touchstart", e => {
+  const t = e.target;
+  if (t && t.closest && t.closest("#chat")) return;
+  mostrarBarra();
+}, {passive:true});
+["bq","vol"].forEach(id => {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.addEventListener("focus", () => mostrarBarra());
+  el.addEventListener("input", () => mostrarBarra());
+});
 
 async function conectar(){
   if (!ativo || conectando) return;
@@ -2355,34 +4067,55 @@ async function conectar(){
     });
     sb = ms.addSourceBuffer(mime);
     sb.mode = "segments";
-    sb.addEventListener("updateend", () => { alinhar(); bombear(); });
+    sb.addEventListener("updateend", () => { alinhar(); bombear(); tentarTocar(); });
     fila = [];
-    aviso("");
+    prontoParaTocar = false;
+    aviso("Carregando buffer (" + ATRASO + "s)...");
     esconderEspera();
-    v.play().catch(()=>{});
     const leitor = r.body.getReader();
     while (true){
       const {done, value} = await leitor.read();
       if (done) break;
       fila.push(value);
       bombear();
+      tentarTocar();
     }
     mostrarEspera("Transmissao pausada. Reconectando...");
   }catch(e){
     mostrarEspera("Reconectando...");
   }
   try{ if (ms && ms.readyState === "open") ms.endOfStream(); }catch(e){}
-  sb = null; ms = null; conectando = false;
+  sb = null; ms = null; conectando = false; prontoParaTocar = false;
   if (ativo) setTimeout(conectar, 1200);
 }
 
-function alinhar(){
+function alinhar(forcar){
   if (!sb) return;
   const b = sb.buffered;
   if (!b.length) return;
-  if (v.currentTime < b.start(0) || v.currentTime > b.end(b.length - 1)){
-    v.currentTime = Math.max(b.start(0), b.end(b.length - 1) - 1.2);
+  const fim = b.end(b.length - 1);
+  const alvo = Math.max(b.start(0), fim - ATRASO);
+  if (forcar || v.currentTime < b.start(0) || v.currentTime > fim ||
+      (!prontoParaTocar && fim - b.start(0) >= Math.min(2, ATRASO * 0.5))){
+    try{ v.currentTime = alvo; }catch(e){}
   }
+}
+function tentarTocar(){
+  if (!sb) return;
+  const b = sb.buffered;
+  if (!b.length) return;
+  const tem = b.end(b.length - 1) - b.start(0);
+  const precisa = Math.max(2, ATRASO * 0.75);
+  if (!prontoParaTocar){
+    if (tem < precisa){
+      aviso("Carregando buffer " + Math.min(100, Math.round(100 * tem / precisa)) + "%...");
+      return;
+    }
+    prontoParaTocar = true;
+    alinhar(true);
+    aviso("");
+  }
+  if (v.paused && v.readyState >= 2) v.play().catch(()=>{});
 }
 function bombear(){
   if (!sb || sb.updating || !fila.length) return;
@@ -2397,26 +4130,51 @@ function bombear(){
     if (e.name === "QuotaExceededError"){
       try{
         const b = sb.buffered;
-        if (b.length) sb.remove(b.start(0), Math.max(b.start(0), v.currentTime - 4));
+        if (b.length) sb.remove(b.start(0), Math.max(b.start(0), v.currentTime - Math.max(8, ATRASO + 2)));
       }catch(_){}
     }
   }
-  if (v.paused && v.readyState >= 2) v.play().catch(()=>{});
 }
+let repondo = false;
 setInterval(() => {
-  if (!sb || sb.updating) return;
+  if (!sb || sb.updating || !prontoParaTocar) return;
   const b = sb.buffered;
   if (!b.length) return;
   const fim = b.end(b.length - 1);
-  if (fim - v.currentTime > 6) v.currentTime = fim - 1.2;
-  else if (fim - v.currentTime > 2.5) v.playbackRate = 1.05;
-  else v.playbackRate = 1;
-  if (v.currentTime - b.start(0) > 30){
-    try{ sb.remove(b.start(0), v.currentTime - 12); }catch(e){}
+  const atras = fim - v.currentTime;
+  if (atras > ATRASO + 4){
+    v.currentTime = fim - ATRASO;
+    v.playbackRate = 1;
+  } else if (atras > ATRASO + 1.5){
+    v.playbackRate = 1.03;
+  } else if (atras < Math.max(1.2, ATRASO * 0.45)){
+    v.playbackRate = 1;
+    if (!repondo && !v.paused && atras < 0.8){
+      repondo = true;
+      v.pause();
+      aviso("Repondo buffer...");
+      const precisa = Math.max(2, ATRASO * 0.7);
+      const t0 = setInterval(() => {
+        const f = folga();
+        if (f >= precisa || !ativo){
+          clearInterval(t0);
+          repondo = false;
+          aviso("");
+          alinhar(true);
+          v.play().catch(()=>{});
+        }
+      }, 300);
+    }
+  } else {
+    v.playbackRate = 1;
   }
-}, 3000);
+  if (v.currentTime - b.start(0) > Math.max(40, ATRASO + 25)){
+    try{ sb.remove(b.start(0), v.currentTime - Math.max(15, ATRASO + 5)); }catch(e){}
+  }
+}, 2000);
 
-v.addEventListener("playing", () => esconderEspera());
+v.addEventListener("playing", () => { esconderEspera(); aviso(""); });
+v.addEventListener("waiting", () => { if (prontoParaTocar) aviso("Repondo buffer..."); });
 v.addEventListener("error", () => { if (ativo) aviso("Erro no video"); });
 
 setInterval(() => {
@@ -2428,6 +4186,9 @@ setInterval(() => {
   fetch("/sinal?t=" + encodeURIComponent(T), {method:"POST",
     headers:{"Content-Type":"application/json"},
     body: JSON.stringify({tocando: !v.paused && v.readyState >= 3, buffer: buf})
+  }).then(r => r.json()).then(d => {
+    if (d && d.qualidade) atualizarQualidadeUI(d.qualidade);
+    if (d && d.atraso != null) aplicarAtrasoHost(d.atraso);
   }).catch(()=>{});
 }, 4000);
 
@@ -2440,9 +4201,8 @@ function adicionar(m){
   el.appendChild(b);
   el.appendChild(document.createTextNode(m.texto));
   lista.appendChild(el);
+  while (lista.children.length > 200) lista.removeChild(lista.firstChild);
   lista.scrollTop = lista.scrollHeight;
-  setTimeout(() => { el.className = "msg saindo";
-    setTimeout(() => el.remove(), 800); }, Math.max(1, m.resta) * 1000);
 }
 function puxarChat(){
   fetch("/chat?t=" + encodeURIComponent(T) + "&desde=" + ultimoChat)
@@ -2451,7 +4211,7 @@ function puxarChat(){
     .catch(()=>{});
 }
 function mandar(){
-  if (meuNome.length < 2){ atualizarGate(); return; }
+  if (meuNome.length < 2){ atualizarGate(); abrirChat(); return; }
   const campo = document.getElementById("texto");
   const texto = campo.value.trim();
   const av = document.getElementById("chat-aviso2");
@@ -2471,7 +4231,10 @@ document.getElementById("nome-novo").addEventListener("keydown", ev => {
   if (ev.key === "Enter") salvarNome();
 });
 atualizarGate();
+chatAberto = lerChatPref();
+aplicarChat();
 atualizarBotao();
+mostrarBarra();
 setInterval(puxarChat, 2000);
 conectar();
 </script>
@@ -2521,14 +4284,24 @@ class Manipulador(http.server.BaseHTTPRequestHandler):
         except Exception:
             return {}
 
+    def _json_html(self, obj):
+        """JSON seguro para embutir dentro de <script>."""
+        return (json.dumps(obj, ensure_ascii=False)
+                .replace("<", "\\u003c")
+                .replace(">", "\\u003e")
+                .replace("&", "\\u0026")
+                .replace("\u2028", "\\u2028")
+                .replace("\u2029", "\\u2029"))
+
     def _envia(self, dados, tipo="application/json; charset=utf-8", codigo=200):
         if isinstance(dados, str):
             dados = dados.encode("utf-8")
         self.send_response(codigo)
         self.send_header("Content-Type", tipo)
         self.send_header("Content-Length", str(len(dados)))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
         self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
         self.end_headers()
         try:
             self.wfile.write(dados)
@@ -2544,6 +4317,39 @@ class Manipulador(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         self._servir()
 
+    def _montar_fontes(self, ctx, forcar_mics=False):
+        try:
+            janelas = listar_janelas()
+        except Exception as e:
+            log("erro listar_janelas:", e)
+            janelas = []
+        try:
+            telas = listar_telas()
+        except Exception as e:
+            log("erro listar_telas:", e)
+            telas = []
+        try:
+            mics = listar_microfones(forcar=forcar_mics)
+        except Exception as e:
+            log("erro listar_microfones:", e)
+            mics = list(_CACHE_MICS["lista"] or [])
+        if not mics:
+            salvo = (ctx.captura.opcoes.get("microfone") or "").strip()
+            if salvo:
+                mics = [{"nome": salvo, "rotulo": salvo[:64]}]
+            threading.Thread(target=aquecer_cache_mics, daemon=True).start()
+        atual = (ctx.captura.opcoes.get("microfone") or "").strip()
+        escolhido = preferir_microfone(mics, atual)
+        if escolhido and escolhido != atual:
+            ctx.captura.opcoes["microfone"] = escolhido
+            ctx.salvar()
+        return {
+            "janelas": janelas,
+            "telas": telas,
+            "microfones": mics,
+            "microfone_atual": ctx.captura.opcoes.get("microfone", ""),
+        }
+
     def _servir(self):
         # Consome o body ANTES de qualquer resposta/atalho.
         corpo = self._corpo() if self.command == "POST" else {}
@@ -2557,23 +4363,67 @@ class Manipulador(http.server.BaseHTTPRequestHandler):
 
         if rota == "/":
             if q.get("k", [""])[0] != ctx.chave_painel:
-                return self._envia("Abra pelo atalho Tela publica.", "text/plain", 403)
+                return self._envia("Abra pelo atalho Transmitir Tela.", "text/plain; charset=utf-8", 403)
             ctx.viu_painel = True
             ctx.ultimo_ping = time.time()
             ctx.cancelar_saida()
-            dados = {"chave": ctx.chave_painel, "opcoes": ctx.captura.opcoes}
-            return self._envia(PAGINA_PAINEL.replace("__DADOS__", json.dumps(dados, ensure_ascii=False)),
-                               "text/html; charset=utf-8")
+            fontes = self._montar_fontes(ctx, forcar_mics=False)
+            log("painel HTML com", len(fontes["janelas"]), "janelas,",
+                len(fontes["telas"]), "telas")
+            dados = {
+                "chave": ctx.chave_painel,
+                "opcoes": ctx.captura.opcoes,
+                "fontes": fontes,
+                "versao": VERSAO,
+            }
+            corpo_pagina = PAGINA_PAINEL.replace("__DADOS__", self._json_html(dados))
+            html = (
+                "<!DOCTYPE html><html lang=\"pt-BR\"><head>\n"
+                + corpo_pagina
+                + "\n</body></html>"
+            )
+            # PAGINA comeca com <meta>/<style>/<div>; fecha o head no fim do style.
+            if "</style>" in html and "</head>" not in html.lower():
+                html = html.replace("</style>", "</style></head><body>", 1)
+            return self._envia(html, "text/html; charset=utf-8")
 
         if rota == "/api/fontes":
-            return self._json({"janelas": listar_janelas(), "telas": listar_telas(),
-                               "microfones": listar_microfones()})
+            forcar_mics = bool(corpo.get("atualizar_mics"))
+            fontes = self._montar_fontes(ctx, forcar_mics=forcar_mics)
+            log("fontes:", len(fontes["janelas"]), "janelas,",
+                len(fontes["telas"]), "telas,",
+                len(fontes["microfones"]), "mics | mic=",
+                fontes.get("microfone_atual", ""))
+            return self._json(fontes)
 
         if rota == "/api/estado":
             return self._json(self._estado_completo())
 
         if rota == "/api/opcoes":
             ctx.captura.aplicar(corpo)
+            ctx.salvar()
+            return self._json(self._estado_completo())
+
+        if rota == "/api/qualidade":
+            nome = corpo.get("qualidade") or corpo.get("nome") or ""
+            if not nome and "nivel" in corpo:
+                try:
+                    idx = int(corpo.get("nivel"))
+                    if 0 <= idx < len(NIVEIS):
+                        nome = NIVEIS[idx]["nome"]
+                except Exception:
+                    nome = ""
+            if not nome:
+                return self._json({"erro": "informe qualidade 480p, 720p ou 1080p"}, 400)
+            if ctx.captura._indice_qualidade(nome) is None:
+                return self._json({"erro": "qualidade invalida (use 480p, 720p ou 1080p)"}, 400)
+            ctx.captura.definir_qualidade(nome)
+            ctx.salvar()
+            return self._json(self._estado_completo())
+
+        if rota == "/api/atraso":
+            if not ctx.captura.definir_atraso(corpo.get("atraso")):
+                return self._json({"erro": "informe atraso 3, 6 ou 10"}, 400)
             ctx.salvar()
             return self._json(self._estado_completo())
 
@@ -2628,6 +4478,9 @@ class Manipulador(http.server.BaseHTTPRequestHandler):
         ctx = self.ctx
         e = ctx.captura.estado_atual()
         agora = time.time()
+        saude = ctx.saude()
+        with ctx.captura.trava:
+            conexao = ctx.captura.diagnostico_conexao(saude)
         e.update({
             "url_publica": ctx.url_publica(),
             "urls_diretas": ctx.urls_diretas(),
@@ -2635,8 +4488,10 @@ class Manipulador(http.server.BaseHTTPRequestHandler):
             "tunel_disponivel": ctx.tunel.disponivel,
             "visores": [v for v in ctx.visores.values() if agora - v["quando"] < 15],
             "adaptacao": ctx.adaptador.diagnostico(),
-            "saude": ctx.saude(),
+            "saude": saude,
+            "conexao": conexao,
             "problemas": ctx.problemas,
+            "versao": VERSAO,
         })
         return e
 
@@ -2677,7 +4532,24 @@ class Manipulador(http.server.BaseHTTPRequestHandler):
                 "quando": agora,
                 "desde": antes.get("desde", agora),
             }
-            return self._json({"ok": True})
+            with ctx.captura.trava:
+                qnome = NIVEIS[ctx.captura.nivel]["nome"]
+            return self._json({"ok": True, "qualidade": qnome,
+                               "atraso": ctx.captura.atraso_atual(),
+                               "niveis": [n["nome"] for n in NIVEIS]})
+
+        if rota == "/qualidade":
+            nome = (corpo.get("qualidade") or corpo.get("nome") or "").strip()
+            if not nome:
+                return self._json({"ok": False, "erro": "informe 480p, 720p ou 1080p"}, 400)
+            if ctx.captura._indice_qualidade(nome) is None:
+                return self._json({"ok": False, "erro": "qualidade invalida"}, 400)
+            ctx.captura.definir_qualidade(nome)
+            ctx.salvar()
+            with ctx.captura.trava:
+                atual = NIVEIS[ctx.captura.nivel]["nome"]
+            return self._json({"ok": True, "qualidade": atual,
+                               "atraso": ctx.captura.atraso_atual()})
 
         return self._envia("Nao encontrado.", "text/plain", 404)
 
@@ -2717,7 +4589,8 @@ class Manipulador(http.server.BaseHTTPRequestHandler):
 
 class Servidor(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
-    allow_reuse_address = True
+    allow_reuse_address = False
+    block_on_close = False
 
     def __init__(self, sock, handler):
         self.socket = sock
@@ -2746,26 +4619,111 @@ def instalar_cloudflared():
     return 0
 
 
+def achar_chrome():
+    if IS_WINDOWS:
+        candidatos = [
+            shutil.which("chrome"),
+            os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%LocalAppData%\Google\Chrome\Application\chrome.exe"),
+        ]
+        for c in candidatos:
+            if c and os.path.isfile(c):
+                return c
+        return None
+    for nome in ("google-chrome", "google-chrome-stable", "chromium",
+                 "chromium-browser"):
+        caminho = shutil.which(nome)
+        if caminho:
+            return caminho
+    return None
+
+
 def abrir_navegador(url):
+    """Abre sempre no Google Chrome quando disponivel."""
+    chrome = achar_chrome()
+    if chrome:
+        try:
+            # DETACHED para o Chrome nao herdar o console (evita fechar junto).
+            flags = 0
+            if IS_WINDOWS:
+                flags = (
+                    getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+                    | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+                )
+            subprocess.Popen(
+                [chrome, "--new-window", "--new-tab", url],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                creationflags=flags if IS_WINDOWS else 0,
+                start_new_session=(not IS_WINDOWS),
+                close_fds=True)
+            log("abrindo painel no Chrome")
+            return True
+        except Exception as e:
+            log("falha ao abrir Chrome:", e)
+
     if IS_WINDOWS:
         try:
             os.startfile(url)
+            log("Chrome nao encontrado; abrindo navegador padrao")
             return True
         except Exception:
-            subprocess.Popen(["start", url], shell=True)
+            subprocess.Popen(["start", "", url], shell=True)
             return True
 
-    for nome in ("google-chrome", "google-chrome-stable", "chromium",
-                 "chromium-browser", "firefox"):
+    for nome in ("firefox",):
         caminho = shutil.which(nome)
         if caminho:
-            args = [caminho, "--app=" + url, "--window-size=920,980"] \
-                if "chrom" in nome else [caminho, url]
-            subprocess.Popen(args, stdout=subprocess.DEVNULL,
+            subprocess.Popen([caminho, url], stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, start_new_session=True)
             return True
     subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, start_new_session=True)
+    return False
+
+
+def registrar_saida_console(ctx):
+    """No Windows, fechar o terminal tambem libera porta e tunel."""
+    if not IS_WINDOWS:
+        return
+
+    Handler = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+
+    @Handler
+    def _handler(ctrl_type):
+        # So reage a fechar janela / logoff / shutdown.
+        # CTRL_C e CTRL_BREAK ficam com o signal do Python.
+        if ctrl_type in (2, 5, 6):
+            try:
+                ctx.encerrar()
+            except Exception:
+                pass
+            time.sleep(1.2)
+            return True
+        return False
+
+    ctypes.windll.kernel32.SetConsoleCtrlHandler(_handler, True)
+    ctx._console_handler = _handler
+
+
+def aguardar_porta(host, porta, timeout=5.0):
+    fim = time.time() + timeout
+    while time.time() < fim:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.3)
+        try:
+            if s.connect_ex((host, porta)) == 0:
+                s.close()
+                return True
+        except Exception:
+            pass
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
+        time.sleep(0.05)
     return False
 
 
@@ -2792,6 +4750,10 @@ def main():
         return 0
 
     os.makedirs(DIR_CACHE, exist_ok=True)
+    if not garantir_instancia_unica():
+        time.sleep(1.2)
+        return 0
+
     if not sys.stdout.isatty():
         sys.stdout = sys.stderr = open(ARQ_LOG, "a", buffering=1)
     else:
@@ -2810,40 +4772,66 @@ def main():
         except Exception:
             pass
 
+    # Cache de mics em background pra nao travar o painel.
+    threading.Thread(target=aquecer_cache_mics, daemon=True).start()
+
     ctx = Contexto()
     sock_pub = porta_livre("0.0.0.0", preferida)
     sock_pai = porta_livre("127.0.0.1", 0)
     ctx.porta_publica = sock_pub.getsockname()[1]
     ctx.porta_painel = sock_pai.getsockname()[1]
 
-    threading.Thread(target=Servidor(
-        sock_pub, partial(Manipulador, ctx=ctx, publico=True)).serve_forever,
-        daemon=True).start()
-    threading.Thread(target=Servidor(
-        sock_pai, partial(Manipulador, ctx=ctx, publico=False)).serve_forever,
-        daemon=True).start()
+    srv_pub = Servidor(sock_pub, partial(Manipulador, ctx=ctx, publico=True))
+    srv_pai = Servidor(sock_pai, partial(Manipulador, ctx=ctx, publico=False))
+    ctx.servidores = [srv_pub, srv_pai]
+    threading.Thread(target=srv_pub.serve_forever, daemon=True).start()
+    threading.Thread(target=srv_pai.serve_forever, daemon=True).start()
 
     log("tela-publica", VERSAO, "| publica", ctx.porta_publica,
         "| painel", ctx.porta_painel)
+    if preferida and ctx.porta_publica != preferida:
+        log("porta", preferida, "ocupada; usando", ctx.porta_publica)
 
     if "--sem-tunel" not in args and ctx.tunel.disponivel:
         ctx.tunel.iniciar(ctx.porta_publica)
+        log("tunel cloudflared apontando para 127.0.0.1:%d" % ctx.porta_publica)
+    elif "--sem-tunel" not in args:
+        log("cloudflared ausente; rode com --instalar-cloudflared para link publico")
 
     atexit.register(ctx.encerrar)
+    registrar_saida_console(ctx)
     for s in (signal.SIGINT, signal.SIGTERM):
         try:
             signal.signal(s, lambda *_: ctx.encerrar())
         except Exception:
             pass
+    if hasattr(signal, "SIGBREAK"):
+        try:
+            signal.signal(signal.SIGBREAK, lambda *_: ctx.encerrar())
+        except Exception:
+            pass
 
     url_painel = "http://127.0.0.1:%d/?k=%s" % (ctx.porta_painel, ctx.chave_painel)
+    salvar_url_painel(url_painel)
     log("painel:", url_painel)
+
+    if not aguardar_porta("127.0.0.1", ctx.porta_painel, 5.0):
+        log("aviso: painel ainda nao respondeu na porta", ctx.porta_painel)
+    try:
+        n_jan = len(listar_janelas())
+        log("janelas detectadas na subida:", n_jan)
+    except Exception as e:
+        log("falha ao listar janelas na subida:", e)
+
     if "--sem-navegador" not in args:
         abrir_navegador(url_painel)
 
     threading.Thread(target=vigia_painel, args=(ctx,), daemon=True).start()
-    while not ctx.encerrando:
-        time.sleep(0.5)
+    try:
+        while not ctx.encerrando:
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        ctx.encerrar()
     return 0
 
 

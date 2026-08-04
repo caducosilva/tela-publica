@@ -1,4 +1,4 @@
-# Cache e configuração local
+# Cache e configuracao local
 ~/.cache/tela-publica/
 *.log
 
@@ -13,10 +13,24 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+.venv/
+venv/
 
-# IDE
+# Copia antiga / rascunho (o script oficial e "tela-publica" sem extensao)
+tela_publica.py
+
+# Testes locais com caminhos do PC
+_teste_e2e.py
+_teste_*.py
+
+# Lixo / help temporario
+vlc-help.txt
+
+# IDE / agentes
 .vscode/
 .idea/
+.cursor/
+.opencode/
 *.swp
 *.swo
 *~
@@ -24,15 +38,24 @@ build/
 # Sistema
 .DS_Store
 Thumbs.db
+Desktop.ini
 
 # Segredos (nunca commitar)
-*.env
+.env
+.env.*
 *.key
 *.pem
 *.jks
 *.keystore
+*credentials*
+*secret*
+*token*.json
 keystore.properties
 local.properties
 
-# cloudflared binary (baixado pelo --instalar-cloudflared)
+# Binarios gerados no cache (compilados na primeira execucao)
+*.exe
+!tela-publica
+
+# cloudflared baixado pelo --instalar-cloudflared
 ~/.local/bin/cloudflared
